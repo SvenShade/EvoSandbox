@@ -44,19 +44,14 @@ def total_energy(state):
     dr    = jnp.sqrt(jnp.sum(dR**2, axis=-1) + _eps**2)
     dotNN = jnp.clip(N @ N.T, -1.0, 1.0)
 
-    # alignment energy: uses stop_gradient to avoid positional forces (for turning only)
-    inside_A = (dr < D_align) & (dr > _eps)
-    wA       = jnp.where(inside_A, 1.0 - dr / D_align, 0.0)
-    # stop_gradient on dr and dotNN so alignment only influences heading updates
-    dr_align  = lax.stop_gradient(dr)
-    dot_align = lax.stop_gradient(dotNN)
-    E_align   = jnp.where(
+    # alignment energy: uses stop_gradient to avoid positional forces
+    inside_A   = (dr < D_align) & (dr > _eps)
+    dr_align   = lax.stop_gradient(dr)
+    dot_align  = lax.stop_gradient(dotNN)
+    wA         = jnp.where(inside_A, 1.0 - dr_align / D_align, 0.0)
+    E_align    = jnp.where(
         inside_A,
         (J_align / a_align) * jnp.power(wA + _eps, a_align) * (1.0 - dot_align)**2,
-        0.0
-    )(
-        inside_A,
-        (J_align / a_align) * jnp.power(wA + _eps, a_align) * (1.0 - dotNN)**2,
         0.0
     )
 
