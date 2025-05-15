@@ -53,14 +53,12 @@ def total_energy(state):
     wR = jnp.clip(1.0 - dr / D_avoid, 0.0, 1.0)
     E_avoid = (J_avoid / a_avoid) * jnp.power(wR + _eps, a_avoid)
 
-    # Cohesion: stop gradient through positions to avoid NaNs
-    wC = jnp.clip((D_cohesion - dr) / D_cohesion, 0.0, 1.0)        # [N,N]
-    dR_coh = lax.stop_gradient(dR)                                # no grad w.r.t R here
-    com = jnp.einsum('ij,ijk->ik', wC, dR_coh)                    # [N,2]
-    wC_sum = jnp.sum(wC, axis=1, keepdims=True) + _eps           # [N,1]
-    com /= wC_sum                                                 # safe weighted mean
-    dir = safe_normalize(com)                                     # [N,2]
-    E_cohesion = 0.5 * J_cohesion * (1.0 - jnp.sum(N * dir, axis=1))**2
+    # Cohesion: quadratic attraction to neighbors within radius
+    wC = jnp.clip((D_cohesion - dr) / D_cohesion, 0.0, 1.0)       # [N,N]
+    # zero-out self-interaction
+    N_agents = R.shape[0]
+    wC = wC * (1.0 - jnp.eye(N_agents))                          # no self-term
+    E_cohesion = 0.5 * J_cohesion * jnp.sum(wC * dr**2)
 
     # total energy: half for pairwise, full for cohesion
     return 0.5 * jnp.sum(E_align + E_avoid) + jnp.sum(E_cohesion)
