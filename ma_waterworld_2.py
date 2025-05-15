@@ -34,31 +34,35 @@ disp_fn, _ = space.free()
 def pairwise_disp(R):
     return space.map_product(disp_fn)(R, R)
 
+
 def total_energy(state):
     R = state['positions']              # [N,2]
-    θ = state['headings']              # [N]
+    θ = state['headings']               # [N]
     N = jnp.stack([jnp.cos(θ), jnp.sin(θ)], axis=-1)  # [N,2]
 
+    # pairwise info
     dR = pairwise_disp(R)              # [N,N,2]
-    dr = jnp.linalg.norm(dR + _eps, axis=-1)  # [N,N], add eps to avoid ∂/∂x x^a blowup
-    dotNN = jnp.clip(N @ N.T, -1.0, 1.0)      # [N,N]
+    dr = jnp.sqrt(jnp.sum(dR**2, axis=-1) + _eps**2)  # [N,N]
+    dotNN = jnp.clip(N @ N.T, -1.0, 1.0)
 
     # Alignment
-    wA = jnp.clip(1. - dr / D_align, 0., 1.0)
-    E_align = (J_align / a_align) * jnp.power(wA + _eps, a_align) * (1 - dotNN)**2
+    wA = jnp.clip(1.0 - dr / D_align, 0.0, 1.0)
+    E_align = (J_align / a_align) * jnp.power(wA + _eps, a_align) * (1.0 - dotNN)**2
 
     # Avoidance
-    wR = jnp.clip(1. - dr / D_avoid, 0., 1.0)
+    wR = jnp.clip(1.0 - dr / D_avoid, 0.0, 1.0)
     E_avoid = (J_avoid / a_avoid) * jnp.power(wR + _eps, a_avoid)
 
-    # Cohesion
-    wC = jnp.clip((D_cohesion - dr) / D_cohesion, 0.0, 1.0)     # [N,N]
-    com = jnp.einsum('ij,ijk->ik', wC, dR)                     # weighted sum
-    wC_sum = jnp.sum(wC, axis=1, keepdims=True) + _eps        # sum of weights
-    com /= wC_sum                                              # weighted mean
-    dir = safe_normalize(com)                                  # [N,2]
+    # Cohesion: stop gradient through positions to avoid NaNs
+    wC = jnp.clip((D_cohesion - dr) / D_cohesion, 0.0, 1.0)        # [N,N]
+    dR_coh = lax.stop_gradient(dR)                                # no grad w.r.t R here
+    com = jnp.einsum('ij,ijk->ik', wC, dR_coh)                    # [N,2]
+    wC_sum = jnp.sum(wC, axis=1, keepdims=True) + _eps           # [N,1]
+    com /= wC_sum                                                 # safe weighted mean
+    dir = safe_normalize(com)                                     # [N,2]
     E_cohesion = 0.5 * J_cohesion * (1.0 - jnp.sum(N * dir, axis=1))**2
 
+    # total energy: half for pairwise, full for cohesion
     return 0.5 * jnp.sum(E_align + E_avoid) + jnp.sum(E_cohesion)
 
 
