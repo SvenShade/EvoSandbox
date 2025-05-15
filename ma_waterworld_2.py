@@ -52,13 +52,12 @@ def total_energy(state):
     E_avoid = (J_avoid / a_avoid) * jnp.power(wR + _eps, a_avoid)
 
     # Cohesion
-    mask = (dr < D_cohesion).astype(jnp.float32)  # [N,N]
-    com = jnp.einsum('ij,ijk->ik', mask, dR)       # [N,2]
-    count = jnp.sum(mask, axis=1, keepdims=True)
-    count_safe = jnp.where(count < _eps, 1.0, count)
-    com /= count_safe
-    dir = safe_normalize(com)
-    E_cohesion = 0.5 * J_cohesion * (1. - jnp.sum(N * dir, axis=1))**2
+    wC = jnp.clip((D_cohesion - dr) / D_cohesion, 0.0, 1.0)     # [N,N]
+    com = jnp.einsum('ij,ijk->ik', wC, dR)                     # weighted sum
+    wC_sum = jnp.sum(wC, axis=1, keepdims=True) + _eps        # sum of weights
+    com /= wC_sum                                              # weighted mean
+    dir = safe_normalize(com)                                  # [N,2]
+    E_cohesion = 0.5 * J_cohesion * (1.0 - jnp.sum(N * dir, axis=1))**2
 
     return 0.5 * jnp.sum(E_align + E_avoid) + jnp.sum(E_cohesion)
 
