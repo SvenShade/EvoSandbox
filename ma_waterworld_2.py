@@ -62,13 +62,19 @@ def total_energy(state):
 
     return 0.5 * jnp.sum(E_align + E_avoid) + jnp.sum(E_cohesion)
 
-force_fn = jit(quantity.force(total_energy))
 
+# ─────── Manual force generator (bypassing quantity.force) ────────────────
+def force_fn_manual(R, θ):
+    # negative gradient w.r.t. positions
+    return -grad(lambda R_, θ_: total_energy({'positions': R_, 'headings': θ_}), argnums=0)(R, θ)
+
+force_fn = jit(force_fn_manual)
+
+# ─────── Compute forces from states ───────────────────────────────────────
 def compute_swarm_forces(agent_states):
     R = jnp.stack([agent_states.pos_x, agent_states.pos_y], axis=-1)
     θ = jnp.arctan2(agent_states.vel_y, agent_states.vel_x + _eps)
-    dstate = force_fn({'positions': R, 'headings': θ})
-    return dstate['positions']
+    return force_fn(R, θ)
 
 
 @jax.vmap
