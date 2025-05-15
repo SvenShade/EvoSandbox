@@ -44,18 +44,23 @@ def total_energy(state):
     dr    = jnp.sqrt(jnp.sum(dR**2, axis=-1) + _eps**2)
     dotNN = jnp.clip(N @ N.T, -1.0, 1.0)
 
-    # alignment energy: masked to cutoff
-    wA      = jnp.clip(1.0 - dr / D_align, 0.0, 1.0)
+    # alignment energy: finite-range, power-law
     inside_A = dr < D_align
-    E_align = jnp.where(
+    wA       = jnp.where(inside_A, 1.0 - dr / D_align, 0.0)
+    E_align  = jnp.where(
         inside_A,
         (J_align / a_align) * jnp.power(wA + _eps, a_align) * (1.0 - dotNN)**2,
         0.0
     )
 
-    # avoidance energy: masked to cutoff
-    wR      = jnp.clip(1.0 - dr / D_avoid, 0.0, 1.0)
-    E_avoid = (J_avoid / a_avoid) * jnp.power(wR + _eps, a_avoid)
+    # avoidance energy: finite-range, power-law
+    inside_R = dr < D_avoid
+    wR       = jnp.where(inside_R, 1.0 - dr / D_avoid, 0.0)
+    E_avoid  = jnp.where(
+        inside_R,
+        (J_avoid / a_avoid) * jnp.power(wR + _eps, a_avoid),
+        0.0
+    )
 
     # cohesion energy: simple spring within cutoff
     mask = dr < D_cohesion                   # boolean mask
