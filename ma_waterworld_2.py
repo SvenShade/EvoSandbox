@@ -1,11 +1,10 @@
-# ma_waterworld.py with integrated swarming (JAX-MD + policy blending)
-
 import jax
 import jax.numpy as jnp
 from jax import jit, vmap
 from flax.struct import dataclass
 from jax_md import space, quantity
 
+# Action constants
 ACT_LEFT, ACT_RIGHT, ACT_UP, ACT_DOWN, ACT_NONE = range(5)
 SCREEN_W, SCREEN_H = 512, 512
 _eps = 1e-6
@@ -20,12 +19,13 @@ class BubbleStatus:
     valid: jnp.bool_
     poison_cnt: jnp.int32
 
+
 def safe_normalize(x, axis=-1, eps=_eps):
     norm = jnp.linalg.norm(x, axis=axis, keepdims=True)
-    norm = jnp.where(norm < eps, 1.0, norm)
-    return x / norm
+    norm_safe = jnp.where(norm < eps, 1.0, norm)
+    return x / norm_safe
 
-# ─────── Flocking energy-based model ─────────────────────────────────────
+
 J_align, D_align, a_align = 1.0, 45.0, 3.0
 J_avoid, D_avoid, a_avoid = 25.0, 30.0, 3.0
 J_cohesion, D_cohesion = 0.1, 40.0
@@ -35,13 +35,13 @@ def pairwise_disp(R):
     return space.map_product(disp_fn)(R, R)
 
 def total_energy(state):
-    R = state['positions']             # [N,2]
+    R = state['positions']              # [N,2]
     θ = state['headings']              # [N]
     N = jnp.stack([jnp.cos(θ), jnp.sin(θ)], axis=-1)  # [N,2]
 
     dR = pairwise_disp(R)              # [N,N,2]
-    dr = jnp.linalg.norm(dR, axis=-1)  # [N,N]
-    dotNN = N @ N.T                    # [N,N]
+    dr = jnp.linalg.norm(dR + _eps, axis=-1)  # [N,N], add eps to avoid ∂/∂x x^a blowup
+    dotNN = jnp.clip(N @ N.T, -1.0, 1.0)      # [N,N]
 
     # Alignment
     wA = jnp.clip(1. - dr / D_align, 0., 1.0)
@@ -53,9 +53,10 @@ def total_energy(state):
 
     # Cohesion
     mask = (dr < D_cohesion).astype(jnp.float32)  # [N,N]
-    com = jnp.einsum('ij,ijk->ik', mask, dR)      # [N,2]
+    com = jnp.einsum('ij,ijk->ik', mask, dR)       # [N,2]
     count = jnp.sum(mask, axis=1, keepdims=True)
-    com /= (count + _eps)
+    count_safe = jnp.where(count < _eps, 1.0, count)
+    com /= count_safe
     dir = safe_normalize(com)
     E_cohesion = 0.5 * J_cohesion * (1. - jnp.sum(N * dir, axis=1))**2
 
@@ -81,7 +82,6 @@ def update_agent_state_swarm(agent: BubbleStatus,
     vx = jnp.where(direction == ACT_RIGHT, vx + 1, vx)
     vx = jnp.where(direction == ACT_LEFT,  vx - 1, vx)
     vx *= 0.95
-
     vy = agent.vel_y
     vy = jnp.where(direction == ACT_UP,   vy - 1, vy)
     vy = jnp.where(direction == ACT_DOWN, vy + 1, vy)
@@ -90,11 +90,9 @@ def update_agent_state_swarm(agent: BubbleStatus,
     fx, fy = force
     vx = policy_weight * vx + energy_weight * fx
     vy = policy_weight * vy + energy_weight * fy
-
     px = agent.pos_x + vx
     py = agent.pos_y + vy
 
-    # Wall collisions
     px = jnp.clip(px, 1, SCREEN_W - 1)
     py = jnp.clip(py, 1, SCREEN_H - 1)
     vx = jnp.where((px == 1) | (px == SCREEN_W - 1), 0, vx)
