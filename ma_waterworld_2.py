@@ -44,20 +44,27 @@ def total_energy(state):
     dr    = jnp.sqrt(jnp.sum(dR**2, axis=-1) + _eps**2)
     dotNN = jnp.clip(N @ N.T, -1.0, 1.0)
 
-    # alignment energy (pairwise)
+    # alignment energy: masked to cutoff
     wA      = jnp.clip(1.0 - dr / D_align, 0.0, 1.0)
-    E_align = (J_align / a_align) * jnp.power(wA + _eps, a_align) * (1.0 - dotNN)**2
+    inside_A = dr < D_align
+    E_align = jnp.where(
+        inside_A,
+        (J_align / a_align) * jnp.power(wA + _eps, a_align) * (1.0 - dotNN)**2,
+        0.0
+    )
 
-    # avoidance energy (pairwise)
+    # avoidance energy: masked to cutoff
     wR      = jnp.clip(1.0 - dr / D_avoid, 0.0, 1.0)
     E_avoid = (J_avoid / a_avoid) * jnp.power(wR + _eps, a_avoid)
 
-    # cohesion energy: spring only within cutoff
-    mask = dr < D_cohesion
-    mask = mask.astype(jnp.float32) * (1.0 - jnp.eye(R.shape[0]))
+    # cohesion energy: simple spring within cutoff
+    mask = dr < D_cohesion                   # boolean mask
+    N_agents = R.shape[0]
+    mask = mask.astype(jnp.float32) * (1.0 - jnp.eye(N_agents))  # remove self
     E_cohesion = 0.5 * J_cohesion * jnp.sum(mask * dr**2)
 
     return 0.5 * jnp.sum(E_align + E_avoid) + E_cohesion
+    
 
 # force generator via manual gradient
 @jit
