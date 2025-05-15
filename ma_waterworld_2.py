@@ -53,11 +53,9 @@ def total_energy(state):
     E_avoid = (J_avoid / a_avoid) * jnp.power(wR + _eps, a_avoid)
 
     # cohesion energy: spring only within cutoff
-    N_agents = R.shape[0]
-    mask = dr < D_cohesion                               # boolean mask [N,N]
-    wC = jnp.where(mask, (D_cohesion - dr) / D_cohesion, 0.0)  # weight zero outside
-    wC = wC * (1.0 - jnp.eye(N_agents))                  # remove self influence
-    E_cohesion = 0.5 * J_cohesion * jnp.sum(wC * dr**2)
+    mask = dr < D_cohesion
+    mask = mask.astype(jnp.float32) * (1.0 - jnp.eye(R.shape[0]))
+    E_cohesion = 0.5 * J_cohesion * jnp.sum(mask * dr**2)
 
     return 0.5 * jnp.sum(E_align + E_avoid) + E_cohesion
 
