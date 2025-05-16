@@ -1,4 +1,4 @@
-# ma_waterworld.py: policy blended with JAX-MD swarming forces
+# ma_waterworld.py: swarming (avoidance+cohesion) + DSR propagation
 
 import jax
 import jax.numpy as jnp
@@ -6,11 +6,11 @@ from jax import jit, vmap, grad
 from flax.struct import dataclass
 from jax_md import space
 
-# Action constants
-ACT_LEFT, ACT_RIGHT, ACT_UP, ACT_DOWN, ACT_NONE = range(5)
-# Environment size
+# Actions
+LEFT, RIGHT, UP, DOWN, NONE = 0, 1, 2, 3, 4
+# Environment constants
+dt = 1.0
 SCREEN_W, SCREEN_H = 512, 512
-# Stability epsilon
 _eps = 1e-6
 
 @dataclass
@@ -22,100 +22,113 @@ class BubbleStatus:
     bubble_type: jnp.int32
     valid: jnp.bool_
     poison_cnt: jnp.int32
+    info: jnp.ndarray
+    info_prev: jnp.ndarray
+    delta_prev: jnp.ndarray
 
-# ─── Swarming potentials hyperparameters ─────────────────────────────────
-J_align, D_align, a_align   = 1.0, 45.0, 3.0
-J_avoid, D_avoid, a_avoid   = 25.0, 30.0, 3.0
-J_cohesion, D_cohesion      = 0.1, 40.0
+# Hyperparameters
+# Positional forces: avoidance + cohesion
+a_avoid, D_avoid = 3.0, 30.0
+J_avoid = 25.0
+J_cohesion, D_cohesion = 0.1, 40.0
+# DSR parameters
+gamma, beta1, beta2 = 1.0, 0.9, 0.99
+# Damping and speed cap
+damping, max_speed = 0.1, 5.0
 
+# Pairwise displacement (free space)
 disp_fn, _ = space.free()
-
-# pairwise displacement function
 def pairwise_disp(R):
     return space.map_product(disp_fn)(R, R)
 
-# total energy: alignment, avoidance, quadratic cohesion
-def total_energy(state):
-    R  = state['positions']            # [N,2]
-    θ  = state['headings']             # [N]
-    N  = jnp.stack([jnp.cos(θ), jnp.sin(θ)], axis=-1)  # [N,2]
+# Positional energy: avoidance + cohesion
+def total_energy_pos(state):
+    R = state['positions']                      # [N,2]
+    dR = pairwise_disp(R)                       # [N,N,2]
+    dr = jnp.sqrt(jnp.sum(dR**2, axis=-1) + _eps**2)  # [N,N]
 
-    dR    = pairwise_disp(R)                          # [N,N,2]
-    dr    = jnp.sqrt(jnp.sum(dR**2, axis=-1) + _eps**2)
-    dotNN = jnp.clip(N @ N.T, -1.0, 1.0)
+    # avoidance: finite-range spring
+    mask_a = (dr < D_avoid) & (dr > _eps)
+    E_avoid = 0.5 * J_avoid * jnp.sum(mask_a * (dr**2))
 
-    # alignment energy: uses stop_gradient to avoid positional forces
-    inside_A   = (dr < D_align) & (dr > _eps)
-    dr_align   = lax.stop_gradient(dr)
-    dot_align  = lax.stop_gradient(dotNN)
-    wA         = jnp.where(inside_A, 1.0 - dr_align / D_align, 0.0)
-    E_align    = jnp.where(
-        inside_A,
-        (J_align / a_align) * jnp.power(wA + _eps, a_align) * (1.0 - dot_align)**2,
-        0.0
-    )
+    # cohesion: finite-range spring
+    mask_c = (dr < D_cohesion) & (dr > _eps)
+    E_cohesion = 0.5 * J_cohesion * jnp.sum(mask_c * (dr**2))
 
-    # avoidance energy: finite-range, power-law
-    inside_R = dr < D_avoid
-    wR       = jnp.where(inside_R, 1.0 - dr / D_avoid, 0.0)
-    E_avoid  = jnp.where(
-        inside_R,
-        (J_avoid / a_avoid) * jnp.power(wR + _eps, a_avoid),
-        0.0
-    )
+    return E_avoid + E_cohesion
 
-    # cohesion energy: simple spring within cutoff
-    mask = dr < D_cohesion                   # boolean mask
-    N_agents = R.shape[0]
-    mask = mask.astype(jnp.float32) * (1.0 - jnp.eye(N_agents))  # remove self
-    E_cohesion = 0.5 * J_cohesion * jnp.sum(mask * dr**2)
-
-    return 0.5 * jnp.sum(E_align + E_avoid) + E_cohesion
-    
-
-# force generator via manual gradient
+# Compute swarm forces
 @jit
-def force_fn(R, θ):
-    return -grad(lambda R_, θ_: total_energy({'positions': R_, 'headings': θ_}), argnums=0)(R, θ)
+def compute_swarm_forces(state):
+    R = jnp.stack([state.pos_x, state.pos_y], axis=-1)
+    θ = jnp.arctan2(state.vel_y, state.vel_x + _eps)
+    # gradient of positional energy w.r.t. positions
+    force_fn = lambda R_, θ_: -grad(
+        lambda RR, TT: total_energy_pos({'positions': RR, 'headings': TT}),
+        argnums=0)(R_, θ_)
+    F = force_fn(R, θ)
+    return F
 
-# compute forces for all agents
-def compute_swarm_forces(agent_states):
-    R = jnp.stack([agent_states.pos_x, agent_states.pos_y], axis=-1)
-    θ = jnp.arctan2(agent_states.vel_y, agent_states.vel_x + _eps)
-    return force_fn(R, θ)  # [N,2]
+# DSR information update
+def compute_info_dsr(state):
+    I, I0, d0 = state.info, state.info_prev, state.delta_prev
+    R = jnp.stack([state.pos_x, state.pos_y], axis=-1)
+    dR = pairwise_disp(R)
+    dr = jnp.linalg.norm(dR, axis=-1)
+    wC = jnp.where(dr < D_cohesion, (D_cohesion - dr) / D_cohesion, 0.0)
+    wC = wC * (1.0 - jnp.eye(wC.shape[0]))
 
-# apply policy update blended with swarm force
+    sum_wC = jnp.sum(wC, axis=1)
+    sum_Ij = jnp.einsum('ij,j->i', wC, I)
+    Δ = sum_wC * I - sum_Ij
+
+    I_dot = -gamma * Δ - beta1 * (Δ - d0) + beta2 * (I - I0)
+    I_next = I + dt * I_dot
+    return I_next, I, Δ
+
+# Agent update: policy + swarm + damping + speed cap
+def clamp_speed(vx, vy):
+    speed = jnp.hypot(vx, vy)
+    factor = jnp.minimum(1.0, max_speed / (speed + _eps))
+    return vx * factor, vy * factor
+
 @jax.vmap
-def update_agent_state_swarm(agent: BubbleStatus,
-                              direction: jnp.int32,
-                              force: jnp.ndarray,
-                              policy_weight: float=1.0,
-                              energy_weight: float=0.1) -> BubbleStatus:
-    # discrete policy velocity update
-    vx = jnp.where(direction == ACT_RIGHT, agent.vel_x + 1, agent.vel_x)
-    vx = jnp.where(direction == ACT_LEFT,  vx - 1, vx) * 0.95
-    vy = jnp.where(direction == ACT_UP,   agent.vel_y - 1, agent.vel_y)
-    vy = jnp.where(direction == ACT_DOWN, agent.vel_y + 1, vy) * 0.95
+def update_agent(agent: BubbleStatus, direction: jnp.int32, force: jnp.ndarray):
+    # discrete policy
+    vx = agent.vel_x + (direction == RIGHT) - (direction == LEFT)
+    vy = agent.vel_y + (direction == DOWN) - (direction == UP)
+    vx, vy = vx * 0.95, vy * 0.95
 
-    # blend in JAX-MD force
+    # add swarm force
     fx, fy = force
-    vx = policy_weight * vx + energy_weight * fx
-    vy = policy_weight * vy + energy_weight * fy
+    vx += fx; vy += fy
 
-    # integrate and handle walls
-    px = jnp.clip(agent.pos_x + vx, 1, SCREEN_W - 1)
-    py = jnp.clip(agent.pos_y + vy, 1, SCREEN_H - 1)
-    vx = jnp.where((px == 1) | (px == SCREEN_W - 1), 0, vx)
-    vy = jnp.where((py == 1) | (py == SCREEN_H - 1), 0, vy)
+    # damping
+    vx *= (1 - damping); vy *= (1 - damping)
+    # speed cap
+    vx, vy = clamp_speed(vx, vy)
 
-    return BubbleStatus(pos_x=px, pos_y=py,
-                         vel_x=vx, vel_y=vy,
-                         bubble_type=agent.bubble_type,
-                         valid=agent.valid,
-                         poison_cnt=agent.poison_cnt)
+    # integrate and bounds
+    px = jnp.clip(agent.pos_x + vx, 0.0, SCREEN_W)
+    py = jnp.clip(agent.pos_y + vy, 0.0, SCREEN_H)
 
-# environment step: compute forces and update agents
+    return BubbleStatus(
+        pos_x=px, pos_y=py,
+        vel_x=vx, vel_y=vy,
+        bubble_type=agent.bubble_type,
+        valid=agent.valid,
+        poison_cnt=agent.poison_cnt,
+        info=agent.info,
+        info_prev=agent.info_prev,
+        delta_prev=agent.delta_prev
+    )
+
+# Environment step
+
 def step_fn(state, directions):
-    forces = compute_swarm_forces(state.agent_state)
-    agents = update_agent_state_swarm(state.agent_state, directions, forces)
+    forces = compute_swarm_forces(state)
+    agents = update_agent(state.agent_state, directions, forces)
+    I_next, I0, Δ = compute_info_dsr(state.agent_state)
+    # update info fields
+    agents = agents.replace(info=I_next, info_prev=I0, delta_prev=Δ)
     return state.replace(agent_state=agents)
