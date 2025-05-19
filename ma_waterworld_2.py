@@ -36,58 +36,49 @@ gamma, beta1, beta2 = 1.0, 0.9, 0.99
 # Damping and speed cap
 damping, max_speed = 0.1, 5.0
 
-# Pairwise displacement (free space)
+# Pairwise displacement (free-space)
 disp_fn, _ = space.free()
-def pairwise_disp(R):
-    return space.map_product(disp_fn)(R, R)
+def pairwise_disp(A, B):
+    return space.map_product(disp_fn)(A, B)
 
-# Total positional energy: agents, food, poison
-def total_energy_pos(R, food_pos, poison_pos):
+# Total positional energy: agents interact with each other and with items
+def total_energy_pos(R, items_R, item_types):
     # agent-agent springs (repulsion + cohesion)
-    dR_aa = pairwise_disp(R, R)  # [N,N,2]
-    dr_aa = jnp.linalg.norm(dR_aa, axis=-1) + _eps  # [N,N]
+    dR_aa = pairwise_disp(R, R)                          # [N,N,2]
+    dr_aa = jnp.linalg.norm(dR_aa, axis=-1) + _eps        # [N,N]
     mask_avoid = dr_aa < D_avoid
-    da = D_avoid - dr_aa
-    E_avoid = 0.5 * J_avoid * jnp.sum(mask_avoid * da**2)
+    da       = D_avoid - dr_aa
+    E_avoid  = 0.5 * J_avoid * jnp.sum(mask_avoid * da**2)
     mask_coh = dr_aa < D_cohesion
     E_cohesion = 0.5 * J_cohesion * jnp.sum(mask_coh * dr_aa**2)
 
-    # agent-food attraction
-    dR_af = pairwise_disp(R, food_pos)  # [N,M,2]
-    dr_af = jnp.linalg.norm(dR_af, axis=-1) + _eps
-    mask_food = dr_af < D_food
-    E_food = 0.5 * J_food * jnp.sum(mask_food * dr_af**2)
-
-    # agent-poison repulsion
-    dR_ap = pairwise_disp(R, poison_pos)  # [N,K,2]
-    dr_ap = jnp.linalg.norm(dR_ap, axis=-1) + _eps
-    mask_p = dr_ap < D_poison
-    dp = D_poison - dr_ap
+    # agent-item interactions
+    dR_ai = pairwise_disp(R, items_R)                    # [N,M,2]
+    dr_ai = jnp.linalg.norm(dR_ai, axis=-1) + _eps        # [N,M]
+    # food items attract
+    is_food = item_types == PREY                         # [M]
+    mask_f  = (dr_ai < D_food) & is_food[None, :]
+    E_food = 0.5 * J_food * jnp.sum(mask_f * dr_ai**2)
+    # poison items repel
+    is_poison = item_types == OBSTACLE                   # [M]
+    mask_p = (dr_ai < D_poison) & is_poison[None, :]
+    dp     = D_poison - dr_ai
     E_poison = 0.5 * J_poison * jnp.sum(mask_p * dp**2)
 
     return E_avoid + E_cohesion + E_food + E_poison
 
-# Compute swarm forces via gradient of energy
+# Compute swarm forces via gradient of positional energy
 def compute_swarm_forces(state):
     # agent positions [N,2]
     R = jnp.stack([state.agent_state.pos_x, state.agent_state.pos_y], axis=-1)
-    # items positions [M,2]
-    items = state.items
-    items_R = jnp.stack([items.pos_x, items.pos_y], axis=-1)
-    # masks for food and poison [M]
-    PREY = 1       # food type constant
-    OBSTACLE = 2   # poison type constant
-    mask_food = (items.bubble_type == PREY).astype(jnp.float32)
-    mask_poison = (items.bubble_type == OBSTACLE).astype(jnp.float32)
-    # masked positions: non-food/poison become zeros
-    food_pos = items_R * mask_food[:, None]
-    poison_pos = items_R * mask_poison[:, None]
-
-    # bind masked item positions into energy function
+    # item positions [M,2] and types [M]
+    items_R = jnp.stack([state.items.pos_x, state.items.pos_y], axis=-1)
+    item_types = state.items.bubble_type
+    # partial energy only in R
     energy_R = functools.partial(total_energy_pos,
-                                 food_pos=food_pos,
-                                 poison_pos=poison_pos)
-    # gradient wrt agent positions
+                                 items_R=items_R,
+                                 item_types=item_types)
+    # compute forces as negative gradient w.r.t. R
     F = -grad(energy_R)(R)
     return F
 
