@@ -41,44 +41,43 @@ disp_fn, _ = space.free()
 def pairwise_disp(A, B):
     return space.map_product(disp_fn)(A, B)
 
-# Total positional energy: agents, items
+# Total positional energy: agents and items interactions
 def total_energy_pos(R, items_R, item_types):
     # agent-agent springs (avoidance + cohesion)
-    dR_aa = pairwise_disp(R, R)
-    dr_aa = jnp.linalg.norm(dR_aa, axis=-1) + _eps
-    mask_avoid = dr_aa < D_avoid
-    da = D_avoid - dr_aa
+    dR_aa = pairwise_disp(R, R)                    # [N,N,2]
+    dr_aa = jnp.linalg.norm(dR_aa, axis=-1) + _eps  # [N,N]
+    mask_avoid = dr_aa < D_avoid                   # [N,N]
+    da = D_avoid - dr_aa                           # [N,N]
     E_avoid = 0.5 * J_avoid * jnp.sum(mask_avoid * da**2)
     mask_coh = dr_aa < D_cohesion
     E_cohesion = 0.5 * J_cohesion * jnp.sum(mask_coh * dr_aa**2)
 
     # agent-item interactions
-    dR_ai = pairwise_disp(R, items_R)  # [N,M,2]
-    dr_ai = jnp.linalg.norm(dR_ai, axis=-1) + _eps  # [N,M]
-    # create type masks
-    is_food   = (item_types == PREY).astype(jnp.float32)    # [M]
-    is_poison = (item_types == OBSTACLE).astype(jnp.float32)
-    # food attraction via where
-    weight_food = jnp.where(dr_ai < D_food, is_food[None, :], 0.0)
-    E_food = 0.5 * J_food * jnp.sum(weight_food * dr_ai**2)
-    # poison repulsion via where
-    raw_p = D_poison - dr_ai
-    weight_poison = jnp.where(dr_ai < D_poison, is_poison[None, :], 0.0)
-    E_poison = 0.5 * J_poison * jnp.sum(weight_poison * raw_p**2)
+    dR_ai = pairwise_disp(R, items_R)              # [N,M,2]
+    dr_ai = jnp.linalg.norm(dR_ai, axis=-1) + _eps # [N,M]
+    # food attraction
+    mask_food = (dr_ai < D_food) & (item_types[None, :] == PREY)
+    E_food = 0.5 * J_food * jnp.sum(mask_food * dr_ai**2)
+    # poison repulsion
+    mask_poison = (dr_ai < D_poison) & (item_types[None, :] == OBSTACLE)
+    dp = D_poison - dr_ai
+    E_poison = 0.5 * J_poison * jnp.sum(mask_poison * dp**2)
 
     return E_avoid + E_cohesion + E_food + E_poison
 
-# Compute swarm forces via gradient of energy (using partial)
-@jit
+# Compute swarm forces via gradient of energy
 def compute_swarm_forces(state):
+    # stack positions
     R = jnp.stack([state.agent_state.pos_x, state.agent_state.pos_y], axis=-1)
     items_R = jnp.stack([state.items.pos_x, state.items.pos_y], axis=-1)
     item_types = state.items.bubble_type
+    # partial to fix items arrays
     energy_R = functools.partial(total_energy_pos,
                                  items_R=items_R,
                                  item_types=item_types)
+    # negative gradient w.r.t. positions
     F = -grad(energy_R)(R)
-    return F
+    return jit(lambda x: F)(state)
 
 # DSR information update
 def compute_info_dsr(state):
