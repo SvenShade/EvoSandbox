@@ -52,14 +52,16 @@ def total_energy_pos(R, items_R, item_types):
     mask_coh = dr_aa < D_cohesion
     E_cohesion = 0.5 * J_cohesion * jnp.sum(mask_coh * dr_aa**2)
 
-    # agent-item interactions
-    dR_ai = pairwise_disp(R, items_R)              # [N,M,2]
-    dr_ai = jnp.linalg.norm(dR_ai, axis=-1) + _eps # [N,M]
+        # agent-item interactions
+    dR_ai = pairwise_disp(R, items_R)                    # [N,M,2]
+    dr_ai = jnp.linalg.norm(dR_ai, axis=-1) + _eps        # [N,M]
     # food attraction
-    mask_food = (dr_ai < D_food) & (item_types[None, :] == PREY)
+    is_food = (item_types == PREY).astype(jnp.float32)    # [M]
+    mask_food = (dr_ai < D_food).astype(jnp.float32) * is_food[None, :]
     E_food = 0.5 * J_food * jnp.sum(mask_food * dr_ai**2)
     # poison repulsion
-    mask_poison = (dr_ai < D_poison) & (item_types[None, :] == OBSTACLE)
+    is_poison = (item_types == OBSTACLE).astype(jnp.float32)  # [M]
+    mask_poison = (dr_ai < D_poison).astype(jnp.float32) * is_poison[None, :]
     dp = D_poison - dr_ai
     E_poison = 0.5 * J_poison * jnp.sum(mask_poison * dp**2)
 
