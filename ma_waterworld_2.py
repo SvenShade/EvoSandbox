@@ -52,20 +52,13 @@ def total_energy_pos(R, items_R, item_types):
     mask_coh = dr_aa < D_cohesion
     E_cohesion = 0.5 * J_cohesion * jnp.sum(mask_coh * dr_aa**2)
 
-        # agent-item interactions
-    dR_ai = pairwise_disp(R, items_R)                    # [N,M,2]
-    dr_ai = jnp.linalg.norm(dR_ai, axis=-1) + _eps        # [N,M]
-    # food attraction
-    is_food = (item_types == PREY).astype(jnp.float32)    # [M]
-    mask_food = (dr_ai < D_food).astype(jnp.float32) * is_food[None, :]
-    E_food = 0.5 * J_food * jnp.sum(mask_food * dr_ai**2)
-    # poison repulsion
-    is_poison = (item_types == OBSTACLE).astype(jnp.float32)  # [M]
-    mask_poison = (dr_ai < D_poison).astype(jnp.float32) * is_poison[None, :]
-    dp = D_poison - dr_ai
-    E_poison = 0.5 * J_poison * jnp.sum(mask_poison * dp**2)
+    # agent-prey springs
+    dr = jnp.linalg.norm(pairwise_disp(R, prey_pos), axis=-1) + _eps  # [N,N]
+    # neighbors exert attraction decaying exponentially with distance
+    w_coh = jnp.where(dr < D_cohesion, jnp.exp(-dr_aa / D_cohesion), 0.0)
+    E_cohesion = J_cohesion * jnp.sum(w_coh)
 
-    return E_avoid + E_cohesion + E_food + E_poison
+    return E_avoid + E_cohesion
 
 # Compute swarm forces via gradient of energy
 def compute_swarm_forces(state):
