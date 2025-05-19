@@ -69,27 +69,27 @@ def total_energy_pos(R, food_pos, poison_pos):
 
 # Compute swarm forces via gradient of energy
 def compute_swarm_forces(state):
-    # agent positions
+    # agent positions [N,2]
     R = jnp.stack([state.agent_state.pos_x, state.agent_state.pos_y], axis=-1)
-    # extract item positions by type
+    # items positions [M,2]
     items = state.items
-    # constants for item types (assumed defined elsewhere)
-    PREY = 1       # food type
-    OBSTACLE = 2   # poison type
-    # select food positions
-    food_mask = items.bubble_type == PREY
-    food_pos = jnp.stack([items.pos_x[food_mask], items.pos_y[food_mask]], axis=-1)
-    # select poison positions
-    poison_mask = items.bubble_type == OBSTACLE
-    poison_pos = jnp.stack([items.pos_x[poison_mask], items.pos_y[poison_mask]], axis=-1)
+    items_R = jnp.stack([items.pos_x, items.pos_y], axis=-1)
+    # masks for food and poison [M]
+    PREY = 1       # food type constant
+    OBSTACLE = 2   # poison type constant
+    mask_food = (items.bubble_type == PREY).astype(jnp.float32)
+    mask_poison = (items.bubble_type == OBSTACLE).astype(jnp.float32)
+    # masked positions: non-food/poison become zeros
+    food_pos = items_R * mask_food[:, None]
+    poison_pos = items_R * mask_poison[:, None]
 
-    # bind food and poison arrays into energy function
+    # bind masked item positions into energy function
     energy_R = functools.partial(total_energy_pos,
                                  food_pos=food_pos,
                                  poison_pos=poison_pos)
-    # compute forces: negative gradient w.r.t. R
+    # gradient wrt agent positions
     F = -grad(energy_R)(R)
-    return jit(lambda x: F)(state)  # return forces for each agent
+    return F
 
 # DSR information update
 def compute_info_dsr(state):
