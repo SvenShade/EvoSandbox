@@ -41,33 +41,40 @@ disp_fn, _ = space.free()
 def pairwise_disp(R):
     return space.map_product(disp_fn)(R, R)
 
-# Positional energy: avoidance + cohesion
-def total_energy_pos(state):
-    R = state['positions']                      # [N,2]
-    dR = pairwise_disp(R)                       # [N,N,2]
-    dr = jnp.sqrt(jnp.sum(dR**2, axis=-1) + _eps**2)  # [N,N]
+# Total positional energy: agents, food, poison
+def total_energy_pos(R, food_pos, poison_pos):
+    # agent-agent springs (repulsion + cohesion)
+    dR_aa = pairwise_disp(R, R)  # [N,N,2]
+    dr_aa = jnp.linalg.norm(dR_aa, axis=-1) + _eps  # [N,N]
+    mask_avoid = dr_aa < D_avoid
+    da = D_avoid - dr_aa
+    E_avoid = 0.5 * J_avoid * jnp.sum(mask_avoid * da**2)
+    mask_coh = dr_aa < D_cohesion
+    E_cohesion = 0.5 * J_cohesion * jnp.sum(mask_coh * dr_aa**2)
 
-    # avoidance: finite-range spring
-    mask_a = (dr < D_avoid) & (dr > _eps)
-    E_avoid = 0.5 * J_avoid * jnp.sum(mask_a * (dr**2))
+    # agent-food attraction
+    dR_af = pairwise_disp(R, food_pos)  # [N,M,2]
+    dr_af = jnp.linalg.norm(dR_af, axis=-1) + _eps
+    mask_food = dr_af < D_food
+    E_food = 0.5 * J_food * jnp.sum(mask_food * dr_af**2)
 
-    # cohesion: finite-range spring
-    mask_c = (dr < D_cohesion) & (dr > _eps)
-    E_cohesion = 0.5 * J_cohesion * jnp.sum(mask_c * (dr**2))
+    # agent-poison repulsion
+    dR_ap = pairwise_disp(R, poison_pos)  # [N,K,2]
+    dr_ap = jnp.linalg.norm(dR_ap, axis=-1) + _eps
+    mask_p = dr_ap < D_poison
+    dp = D_poison - dr_ap
+    E_poison = 0.5 * J_poison * jnp.sum(mask_p * dp**2)
 
-    return E_avoid + E_cohesion
+    return E_avoid + E_cohesion + E_food + E_poison
 
-# Compute swarm forces
-@jit
+# Compute swarm forces via gradient of energy
 def compute_swarm_forces(state):
     R = jnp.stack([state.pos_x, state.pos_y], axis=-1)
-    θ = jnp.arctan2(state.vel_y, state.vel_x + _eps)
-    # gradient of positional energy w.r.t. positions
-    force_fn = lambda R_, θ_: -grad(
-        lambda RR, TT: total_energy_pos({'positions': RR, 'headings': TT}),
-        argnums=0)(R_, θ_)
-    F = force_fn(R, θ)
-    return F
+    food_pos = jnp.stack([state.food_x, state.food_y], axis=-1)
+    poison_pos = jnp.stack([state.poison_x, state.poison_y], axis=-1)
+    energy_R = functools.partial(total_energy_pos, food_pos=food_pos, poison_pos=poison_pos)
+    F = -grad(energy_R)(R)
+    return jit(lambda S: F)(state)
 
 # DSR information update
 def compute_info_dsr(state):
