@@ -1,5 +1,6 @@
 import numpy as np
 from scipy.ndimage import gaussian_filter
+from scipy.signal import fftconvolve
 
 def binary_to_heatmap(mask: np.ndarray, sigma: float = 2.0) -> np.ndarray:
     """
@@ -22,15 +23,35 @@ def binary_to_heatmap(mask: np.ndarray, sigma: float = 2.0) -> np.ndarray:
         heatmap /= max_val
     return heatmap
 
-# Example usage
-if __name__ == "__main__":
-    # Create a sample binary mask
-    mask = np.zeros((100, 100), dtype=np.uint8)
-    mask[30, 40] = 1
-    mask[70, 80] = 1
+def make_lorentzian_kernel(size, gamma):
+    """
+    Create a normalized 2D Lorentzian (Cauchy) kernel.
+    
+    Args:
+        size: int, kernel will be (size x size), size should be odd.
+        gamma: scale parameter (controls width).
+    Returns:
+        kernel: 2D float32 numpy array summing to 1.
+    """
+    assert size % 2 == 1, "Size must be odd"
+    ax = np.arange(-size//2 + 1, size//2 + 1, dtype=np.float32)
+    xx, yy = np.meshgrid(ax, ax)
+    rr2 = xx**2 + yy**2
+    # Unnormalized Lorentzian
+    kernel = 1.0 / (1.0 + rr2/(gamma**2))
+    # Normalize so sum == 1
+    kernel /= kernel.sum()
+    return kernel
 
-    # Generate Gaussian heatmap
-    heatmap = binary_to_heatmap(mask, sigma=3.0)
-
-    # Display ranges
-    print("Heatmap min/max:", heatmap.min(), heatmap.max())
+def binary_to_lorentz_heatmap(mask, size=31, gamma=3.0):
+    """
+    Convolve binary mask with a Lorentzian kernel.
+    """
+    kernel = make_lorentzian_kernel(size, gamma)
+    # Use fft-based convolution for speed & same-shape output
+    heatmap = fftconvolve(mask.astype(np.float32), kernel, mode='same')
+    # Optional: renormalize so peak == 1
+    peak = heatmap.max()
+    if peak > 0:
+        heatmap /= peak
+    return heatmap
