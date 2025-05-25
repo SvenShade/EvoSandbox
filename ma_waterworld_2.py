@@ -60,16 +60,19 @@ def total_energy_pos(R, items_R, item_types,
     mask_c = dc < D_coh_arr[:,None]
     E_cohesion = 0.5 * jnp.sum(J_coh_arr[:,None] * mask_c * dc**2)
 
-    # agent-item
-    dR_ai = pairwise_disp(R, items_R)               # [N,M,2]
-    dr_ai = jnp.sqrt(jnp.sum(dR_ai**2, axis=-1) + _eps**2) # [N,M]
-    # broadcast per-agent J and D
-    Jf = J_food_arr[:,None]; Df = D_food_arr[:,None]
-    mask_f = dr_ai < Df
+        # agent-item interactions
+    dR_ai = pairwise_disp(R, items_R)                   # [N,M,2]
+    dr_ai = jnp.sqrt(jnp.sum(dR_ai**2, axis=-1) + _eps**2)  # [N,M]
+    # per-agent and per-item cutoffs
+    Jf = J_food_arr[:, None]  # [N,1], broadcast to [N,M]
+    Df = D_food_arr[:, None]  # [N,1]
+    mask_f = dr_ai < Df       # [N,M]
     E_food = 0.5 * jnp.sum(Jf * mask_f * dr_ai**2)
-    Jp = J_poison_arr[:,None]; Dp = D_poison_arr[:,None]
-    dp = Dp - dr_ai
-    mask_p = dr_ai < Dp
+
+    Jp = J_poison_arr[:, None]  # [N,1]
+    Dp = D_poison_arr[:, None]  # [N,1]
+    dp = Dp - dr_ai             # [N,M]
+    mask_p = dr_ai < Dp         # [N,M]
     E_poison = 0.5 * jnp.sum(Jp * mask_p * dp**2)
 
     # perimeter
@@ -82,19 +85,46 @@ def total_energy_pos(R, items_R, item_types,
 
     return E_avoid + E_cohesion + E_food + E_poison + E_perim
 
-# Compute swarm forces via gradient of energy
+# Compute swarm forces with per-agent coefficients
 def compute_swarm_forces(state):
-    # stack positions
+    # agent positions
     R = jnp.stack([state.agent_state.pos_x, state.agent_state.pos_y], axis=-1)
+    # items
     items_R = jnp.stack([state.items.pos_x, state.items.pos_y], axis=-1)
     item_types = state.items.bubble_type
-    # partial to fix items arrays
-    energy_R = functools.partial(total_energy_pos,
-                                 items_R=items_R,
-                                 item_types=item_types)
-    # negative gradient w.r.t. positions
+    # per-agent arrays
+    ba = state.agent_state
+    J_avoid_arr   = ba.J_avoid
+    D_avoid_arr   = ba.D_avoid
+    J_coh_arr     = ba.J_cohesion
+    D_coh_arr     = ba.D_cohesion
+    J_food_arr    = ba.J_food
+    D_food_arr    = ba.D_food
+    J_poison_arr  = ba.J_poison
+    D_poison_arr  = ba.D_poison
+    J_perim_arr   = ba.J_perimeter
+    perim_rad_arr = ba.perimeter_radius
+    origins       = jnp.stack([ba.origin_x, ba.origin_y], axis=-1)
+
+    energy_R = functools.partial(
+        total_energy_pos,
+        items_R=items_R,
+        item_types=item_types,
+        J_avoid_arr=J_avoid_arr,
+        D_avoid_arr=D_avoid_arr,
+        J_coh_arr=J_coh_arr,
+        D_coh_arr=D_coh_arr,
+        J_food_arr=J_food_arr,
+        D_food_arr=D_food_arr,
+        J_poison_arr=J_poison_arr,
+        D_poison_arr=D_poison_arr,
+        J_perim_arr=J_perim_arr,
+        perim_rad_arr=perim_rad_arr,
+        origins=origins
+    )
     F = -grad(energy_R)(R)
-    return jit(lambda x: F)(state)
+    return F
+
 
 # DSR information update
 def compute_info_dsr(state):
