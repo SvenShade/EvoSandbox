@@ -41,24 +41,46 @@ disp_fn, _ = space.free()
 def pairwise_disp(A, B):
     return space.map_product(disp_fn)(A, B)
 
-# Total positional energy: agents and items interactions
-def total_energy_pos(R, items_R, item_types):
-    # agent-agent springs (avoidance + cohesion)
-    dR_aa = pairwise_disp(R, R)                    # [N,N,2]
-    dr_aa = jnp.linalg.norm(dR_aa, axis=-1) + _eps  # [N,N]
-    mask_avoid = dr_aa < D_avoid                   # [N,N]
-    da = D_avoid - dr_aa                           # [N,N]
-    E_avoid = 0.5 * J_avoid * jnp.sum(mask_avoid * da**2)
-    mask_coh = dr_aa < D_cohesion
-    E_cohesion = 0.5 * J_cohesion * jnp.sum(mask_coh * dr_aa**2)
+# Total positional energy with per-agent coefficients
+def total_energy_pos(R, items_R, item_types,
+                     J_avoid_arr, D_avoid_arr,
+                     J_coh_arr, D_coh_arr,
+                     J_food_arr, D_food_arr,
+                     J_poison_arr, D_poison_arr,
+                     J_perim_arr, perim_rad_arr,
+                     origins):
+    N = R.shape[0]
+    # agent-agent
+    dR_aa = pairwise_disp(R, R) # [N,N,2]
+    dr_aa = jnp.sqrt(jnp.sum(dR_aa**2, axis=-1) + _eps**2) # [N,N]
+    da = D_avoid_arr[:,None] - dr_aa                      # [N,N]
+    mask_a = dr_aa < D_avoid_arr[:,None]
+    E_avoid = 0.5 * jnp.sum(J_avoid_arr[:,None] * mask_a * da**2)
+    dc = dr_aa                                      # reuse dr_aa
+    mask_c = dc < D_coh_arr[:,None]
+    E_cohesion = 0.5 * jnp.sum(J_coh_arr[:,None] * mask_c * dc**2)
 
-    # agent-prey springs
-    dr = jnp.linalg.norm(pairwise_disp(R, prey_pos), axis=-1) + _eps  # [N,N]
-    # neighbors exert attraction decaying exponentially with distance
-    w_coh = jnp.where(dr < D_cohesion, jnp.exp(-dr_aa / D_cohesion), 0.0)
-    E_cohesion = J_cohesion * jnp.sum(w_coh)
+    # agent-item
+    dR_ai = pairwise_disp(R, items_R)               # [N,M,2]
+    dr_ai = jnp.sqrt(jnp.sum(dR_ai**2, axis=-1) + _eps**2) # [N,M]
+    # broadcast per-agent J and D
+    Jf = J_food_arr[:,None]; Df = D_food_arr[:,None]
+    mask_f = dr_ai < Df
+    E_food = 0.5 * jnp.sum(Jf * mask_f * dr_ai**2)
+    Jp = J_poison_arr[:,None]; Dp = D_poison_arr[:,None]
+    dp = Dp - dr_ai
+    mask_p = dr_ai < Dp
+    E_poison = 0.5 * jnp.sum(Jp * mask_p * dp**2)
 
-    return E_avoid + E_cohesion
+    # perimeter
+    origins = origins.reshape(N,2)
+    dR0 = R - origins                            # [N,2]
+    dr0 = jnp.sqrt(jnp.sum(dR0**2, axis=-1) + _eps**2) # [N]
+    pr = perim_rad_arr
+    dr0_c = jnp.minimum(dr0, pr)
+    E_perim = 0.5 * jnp.sum(J_perim_arr * dr0_c**2)
+
+    return E_avoid + E_cohesion + E_food + E_poison + E_perim
 
 # Compute swarm forces via gradient of energy
 def compute_swarm_forces(state):
