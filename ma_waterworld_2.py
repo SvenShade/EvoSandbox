@@ -125,6 +125,19 @@ def compute_swarm_forces(state):
     F = -grad(energy_R)(R)
     return F
 
+def total_energy_coeff(J_arr, R, D_arr):
+    """
+    Energy measuring deviation of J_cohesion, weighted by proximity:
+    E = 0.5 * Σ_{i,j} w_{ij} (J_i - J_j)^2,
+    w_{ij} = exp(-dr_{ij}/D_i) if dr_{ij}<D_i else 0
+    """
+    dR = pairwise_disp(R, R)
+    dr = jnp.sqrt(jnp.sum(dR**2, axis=-1) + _eps**2)
+    # proximity weight
+    w = jnp.where(dr < D_arr[:, None], jnp.exp(-dr / D_arr[:, None]), 0.0)
+    diff = J_arr[:, None] - J_arr[None, :]
+    E = 0.5 * jnp.sum(w * diff**2)
+    return E
 
 # DSR information update
 def compute_info_dsr(state):
