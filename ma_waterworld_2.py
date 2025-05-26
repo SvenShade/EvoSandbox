@@ -126,16 +126,22 @@ def compute_swarm_forces(state):
     return F
 
 def total_energy_coeff(J_arr, R, D_arr):
-    """
-    Energy measuring deviation of J_cohesion, weighted by proximity:
-    E = 0.5 * Σ_{i,j} w_{ij} (J_i - J_j)^2,
-    w_{ij} = exp(-dr_{ij}/D_i) if dr_{ij}<D_i else 0
-    """
-    dR = pairwise_disp(R, R)
-    dr = jnp.sqrt(jnp.sum(dR**2, axis=-1) + _eps**2)
-    # proximity weight
-    w = jnp.where(dr < D_arr[:, None], jnp.exp(-dr / D_arr[:, None]), 0.0)
-    diff = J_arr[:, None] - J_arr[None, :]
+    # pairwise distances
+    dR = pairwise_disp(R, R)  # [N, N, 2]
+    dr = jnp.sqrt(jnp.sum(dR**2, axis=-1) + _eps**2)  # [N, N]
+    # expand distances to [N, N, C]
+    drC = dr[:, :, None]  # [N, N, 1]
+    drC = jnp.broadcast_to(drC, (J_arr.shape[0], J_arr.shape[0], J_arr.shape[1]))
+    # expand D_arr to [N, 1, C]
+    D_exp = D_arr[:, None, :]  # [N, 1, C]
+    # mask and weight
+    mask = drC < D_exp
+    w = jnp.where(mask, jnp.exp(-drC / D_exp), 0.0)
+    # pairwise coefficient differences [N, N, C]
+    J_i = J_arr[:, None, :]    # [N, 1, C]
+    J_j = J_arr[None, :, :]    # [1, N, C]
+    diff = J_i - J_j           # broadcasts to [N, N, C]
+    # energy: 0.5 * Σ_{i,j,k} w_{i,j,k} * diff_{i,j,k}^2
     E = 0.5 * jnp.sum(w * diff**2)
     return E
 
