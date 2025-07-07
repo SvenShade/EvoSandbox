@@ -139,6 +139,9 @@ class Params:
         self.world_radius_sq     = self.world_radius**2
         self.view_radius_sq      = self.view_radius**2
         self.collision_radius_sq = self.collision_radius**2
+        # number of cells per axis for spatial hash
+        self.num_cells = jnp.ceil(2*self.world_radius / self.view_radius).astype(int)
+        self.num_cells_sq = self.num_cells**2
 
 # Precompute ground grid offsets
 _lin = jnp.linspace; _mesh = jnp.meshgrid
@@ -148,6 +151,110 @@ GRID_OFFSETS = _mesh(
     indexing='xy'
 )
 GRID_OFFSETS = jnp.stack([GRID_OFFSETS[0].ravel(), GRID_OFFSETS[1].ravel()], -1)
+
+
+
+@jax.jit
+
+def build_cell_list(pos_xy: jnp.ndarray, params: Params):
+    """
+    Compute cell_id and cell index structures for N agents.
+    Returns:
+      order: (N,) indices sorted by cell_id
+      starts: (C*C+1,) start indices in order for each cell
+      cell_id: (N,) cell_id for each agent
+    """
+    # cell coords in [0, C)
+    cell_xy = jnp.floor((pos_xy + params.world_radius) / params.view_radius).astype(int)
+    cell_xy = jnp.clip(cell_xy, 0, params.num_cells-1)
+    cell_id = cell_xy[:,0] * params.num_cells + cell_xy[:,1]
+    # sort by cell_id
+    order = jnp.argsort(cell_id)
+    sorted_c = cell_id[order]
+    # counts per cell
+    counts = jnp.bincount(sorted_c, length=params.num_cells_sq)
+    # prefix sums for start
+    starts = jnp.concatenate([jnp.array([0]), jnp.cumsum(counts)])
+    return order, starts, cell_id
+
+# --- Helpers: neighbor lookup ---
+@jax.jit
+
+def gather_neighbors(order: jnp.ndarray, starts: jnp.ndarray, cell_id: jnp.ndarray, params: Params):
+    """
+    For each agent, gather indices of neighbors in adjacent cells.
+    Returns ragged array padded to max_k agents: shape (N, K)
+    """
+    N = cell_id.shape[0]
+    C = params.num_cells
+    # compute each agent's cell coords
+    cell_xy = jnp.stack([cell_id // C, cell_id % C], axis=-1)
+    # offsets for 3x3
+    offs = jnp.array([[-1,-1],[-1,0],[-1,1],[0,-1],[0,0],[0,1],[1,-1],[1,0],[1,1]])
+    def per_agent(i, carry):
+        ci, cj = cell_xy[i]
+        neigh_ids = []
+        for off in offs:
+            ni, nj = ci+off[0], cj+off[1]
+            # check bounds
+            if (ni>=0) & (ni<C) & (nj>=0)&(nj<C):
+                cid = ni*C + nj
+                start = starts[cid]
+                end = starts[cid+1]
+                neigh_ids.append(order[start:end])
+        alln = jnp.concatenate(neigh_ids)
+        # pad/truncate to K=params.num_ent*3
+        K = params.num_ent * 3
+        pad = K - alln.shape[0]
+        def pad_fn(): return jnp.concatenate([alln, jnp.zeros(pad, dtype=int)])
+        def trunc(): return alln[:K]
+        return jax.lax.cond(pad>0, pad_fn, trunc)
+    # vmap
+    neighbors = jax.vmap(per_agent, in_axes=(0,None))(jnp.arange(N), None)
+    return neighbors  # shape (N,K)
+
+# --- Environment Functions ---
+@jax.jit
+
+def reset(key: jnp.ndarray, params: Params):
+    # generate terrain, state as before
+    # omitted for brevity...
+    pass
+
+@jax.jit
+
+def step(state, action, params: Params):
+    pos, vel, alive, teams, poi, heightmap, sc, key = state
+    # dynamics and collisions as before except neighbor collision:
+    # build 2D positions
+    pos_xy = pos[:, :2]
+    order, starts, cell_id = build_cell_list(pos_xy, params)
+    neigh = gather_neighbors(order, starts, cell_id, params)
+    # scatter neighbors for each agent
+    def collide_agent(i):
+        idxs = neigh[i]
+        rels = pos[i] - pos[idxs]
+        d2s = jnp.sum(rels**2, axis=-1)
+        return jnp.any(d2s < params.collision_radius_sq)
+    collide = jax.vmap(collide_agent)(jnp.arange(params.num_drones))
+    # proceed with alive update, etc.
+    # ... continue rest of step ...
+    pass
+
+@jax.jit
+
+def get_obs(state, params: Params):
+    pos, vel, alive, teams, poi, heightmap, sc, key = state
+    # build neighbor lists as in step
+    pos_xy = pos[:, :2]
+    order, starts, cell_id = build_cell_list(pos_xy, params)
+    neigh = gather_neighbors(order, starts, cell_id, params)
+    # for each agent, select top-E friend/enemy from its k neighbors
+    # use vmap over agents similar to collision
+    # ... implement per-agent selection using rels and argsort over k instead of N ...
+    pass
+
+
 
 @jax.jit
 
