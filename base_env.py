@@ -13,64 +13,72 @@ def interpolant(t: jnp.ndarray) -> jnp.ndarray:
 
 
 def generate_perlin_noise_2d(
+    key: jnp.ndarray,
     shape: tuple[int, int],
     res: tuple[int, int],
-    tileable: tuple[bool, bool] = (False, False),
-    interpolant=interpolant
-) -> jnp.ndarray:
+    tileable: tuple[bool, bool] = (False, False)
+) -> tuple[jnp.ndarray, jnp.ndarray]:
     """
-    Generate a single-octave Perlin noise heightmap of dimensions `shape`.
+    Generate single-octave Perlin noise heightmap using JAX RNG key.
+    Returns (next_key, heightmap).
     """
+    key, subkey = jax.random.split(key)
+    angles = jax.random.uniform(subkey, (res[0] + 1, res[1] + 1), 0.0, 2*jnp.pi)
+    gradients = jnp.stack([jnp.cos(angles), jnp.sin(angles)], axis=-1)
+    if tileable[0]: gradients = gradients.at[-1, :].set(gradients[0, :])
+    if tileable[1]: gradients = gradients.at[:, -1].set(gradients[:, 0])
+
     grid = jnp.stack(jnp.meshgrid(
         jnp.linspace(0, res[0], shape[0], endpoint=False) % 1,
         jnp.linspace(0, res[1], shape[1], endpoint=False) % 1,
         indexing='ij'
     ), axis=-1)
-    angles = 2 * np.pi * np.random.rand(res[0] + 1, res[1] + 1)
-    gradients = np.dstack((np.cos(angles), np.sin(angles)))
-    if tileable[0]: gradients[-1, :] = gradients[0, :]
-    if tileable[1]: gradients[:, -1] = gradients[:, 0]
-    d = (shape[0] // res[0], shape[1] // res[1])
-    gradients = np.repeat(np.repeat(gradients, d[0], axis=0), d[1], axis=1)
-    g00 = jnp.array(gradients[:-d[0], :-d[1]])
-    g10 = jnp.array(gradients[d[0]:, :-d[1]])
-    g01 = jnp.array(gradients[:-d[0], d[1]:])
-    g11 = jnp.array(gradients[d[0]:, d[1]:])
+
+    d0, d1 = shape[0] // res[0], shape[1] // res[1]
+    grads = jnp.repeat(jnp.repeat(gradients, d0, axis=0), d1, axis=1)
+    g00 = grads[:-d0, :-d1]
+    g10 = grads[d0:, :-d1]
+    g01 = grads[:-d0, d1:]
+    g11 = grads[d0:, d1:]
+
     n00 = jnp.sum(grid * g00, axis=-1)
-    n10 = jnp.sum((grid - jnp.array([1, 0])) * g10, axis=-1)
-    n01 = jnp.sum((grid - jnp.array([0, 1])) * g01, axis=-1)
-    n11 = jnp.sum((grid - jnp.array([1, 1])) * g11, axis=-1)
+    n10 = jnp.sum((grid - jnp.array([1.0, 0.0])) * g10, axis=-1)
+    n01 = jnp.sum((grid - jnp.array([0.0, 1.0])) * g01, axis=-1)
+    n11 = jnp.sum((grid - jnp.array([1.0, 1.0])) * g11, axis=-1)
+
     t = interpolant(grid)
-    n0 = n00 * (1 - t[:, :, 0]) + t[:, :, 0] * n10
-    n1 = n01 * (1 - t[:, :, 0]) + t[:, :, 0] * n11
-    return jnp.sqrt(2) * ((1 - t[:, :, 1]) * n0 + t[:, :, 1] * n1)
+    n0 = n00 * (1 - t[:,:,0]) + t[:,:,0] * n10
+    n1 = n01 * (1 - t[:,:,0]) + t[:,:,0] * n11
+    noise = jnp.sqrt(2) * ((1 - t[:,:,1]) * n0 + t[:,:,1] * n1)
+    return key, noise
 
 
 def generate_fractal_noise_2d(
+    key: jnp.ndarray,
     shape: tuple[int,int],
     res: tuple[int,int],
     octaves: int = 4,
     persistence: float = 0.5,
     lacunarity: float = 2.0,
-    tileable: tuple[bool,bool] = (False, False),
-    interpolant=interpolant
-) -> jnp.ndarray:
+    tileable: tuple[bool,bool] = (False, False)
+) -> tuple[jnp.ndarray,jnp.ndarray]:
     """
-    Generate fractal Perlin noise by summing multiple octaves.
+    Generate multi-octave Perlin noise; returns (next_key, heightmap).
     """
     noise = jnp.zeros(shape)
-    frequency = 1
-    amplitude = 1
+    frequency = 1.0
+    amplitude = 1.0
     for _ in range(octaves):
-        noise += amplitude * generate_perlin_noise_2d(
+        key, single = generate_perlin_noise_2d(
+            key,
             shape,
-            (int(res[0] * frequency), int(res[1] * frequency)),
-            tileable,
-            interpolant
+            (int(res[0]*frequency), int(res[1]*frequency)),
+            tileable
         )
+        noise += amplitude * single
         frequency *= lacunarity
         amplitude *= persistence
-    return noise
+    return key, noise
 
 
 def interpolate_heightmap(
@@ -79,16 +87,16 @@ def interpolate_heightmap(
     world_size: tuple[float, float]
 ) -> jnp.ndarray:
     """
-    Bilinear interpolation of a heightmap at points xy.
+    Bilinear interpolation of heightmap at XY positions.
     """
     H, W = heightmap.shape
     wx, wy = world_size
-    grid_x = (xy[:, 0] + wx/2) * (W - 1) / wx
-    grid_y = (xy[:, 1] + wy/2) * (H - 1) / wy
+    grid_x = (xy[:,0] + wx/2) * (W-1) / wx
+    grid_y = (xy[:,1] + wy/2) * (H-1) / wy
     x0 = jnp.floor(grid_x).astype(jnp.int32)
-    x1 = jnp.clip(x0 + 1, 0, W - 1)
     y0 = jnp.floor(grid_y).astype(jnp.int32)
-    y1 = jnp.clip(y0 + 1, 0, H - 1)
+    x1 = jnp.clip(x0+1, 0, W-1)
+    y1 = jnp.clip(y0+1, 0, H-1)
     wx_f = grid_x - x0
     wy_f = grid_y - y0
     h00 = heightmap[y0, x0]
@@ -96,94 +104,91 @@ def interpolate_heightmap(
     h01 = heightmap[y1, x0]
     h11 = heightmap[y1, x1]
     return (
-        h00 * (1 - wx_f) * (1 - wy_f) +
-        h10 * wx_f       * (1 - wy_f) +
-        h01 * (1 - wx_f) * wy_f       +
-        h11 * wx_f       * wy_f
+        h00*(1-wx_f)*(1-wy_f) +
+        h10*wx_f*(1-wy_f) +
+        h01*(1-wx_f)*wy_f +
+        h11*wx_f*wy_f
     )
-
-
-class Perlin2D:
-    """
-    Precomputes a fractal Perlin noise map and interpolates on query.
-    """
-    def __init__(
-        self,
-        world_radius: float,
-        view_radius: float,
-        map_size: int = 256,
-        octaves: int = 4
-    ):
-        self.world_radius = world_radius
-        self.heightmap = generate_fractal_noise_2d((map_size, map_size), res=(8,8), octaves=octaves)
-
-    def __call__(self, xy: jnp.ndarray) -> jnp.ndarray:
-        return interpolate_heightmap(
-            self.heightmap,
-            xy,
-            (2 * self.world_radius, 2 * self.world_radius)
-        )
 
 # --- Environment Definition ---
 
 @dataclass
 class Params:
-    # Core environment parameters
-    num_drones: int = 10             # number of drone agents
-    num_teams: int = 2               # number of teams (friendly vs enemy)
-    world_radius: float = 1.0        # radius of map
-    max_acceleration: float = 0.01   # max acceleration per axis
-    min_speed: float = 0.0           # minimum speed clamp
-    max_speed: float = 0.03          # maximum speed clamp
-    collision_radius: float = 0.05   # collision threshold for drones
-    view_radius: float = 0.2         # visibility radius
-    num_poi: int = 5                 # number of points of interest
-    ground_res: int = 16             # resolution of ground patch grid
-    num_ent: int = 5                 # max visible entities per type
-    max_steps: int = 200             # max episode length
-    # Precomputed squared thresholds for efficiency
+    # Core parameters
+    num_drones: int = 10
+    num_teams: int = 2
+    world_radius: float = 1.0
+    max_acceleration: float = 0.01
+    min_speed: float = 0.0
+    max_speed: float = 0.03
+    collision_radius: float = 0.05
+    view_radius: float = 0.2
+    num_poi: int = 5
+    ground_res: int = 16
+    num_ent: int = 5
+    max_steps: int = 200
+    # Perlin params
+    map_size: int = 256
+    perlin_octaves: int = 4
+    # Precomputed squares
     world_radius_sq: float = field(init=False)
     view_radius_sq: float = field(init=False)
     collision_radius_sq: float = field(init=False)
 
     def __post_init__(self):
-        # Compute squared radii once
-        self.world_radius_sq     = self.world_radius ** 2
-        self.view_radius_sq      = self.view_radius ** 2
-        self.collision_radius_sq = self.collision_radius ** 2
+        self.world_radius_sq     = self.world_radius**2
+        self.view_radius_sq      = self.view_radius**2
+        self.collision_radius_sq = self.collision_radius**2
 
-# Precompute ground patch offsets (square grid over [-view_radius,view_radius])
+# Precompute ground grid offsets
 _lin = jnp.linspace; _mesh = jnp.meshgrid
 GRID_OFFSETS = _mesh(
-    _lin(-1.0, 1.0, Params.ground_res) * Params.view_radius,
-    _lin(-1.0, 1.0, Params.ground_res) * Params.view_radius,
+    _lin(-1,1,Params.ground_res)*Params.view_radius,
+    _lin(-1,1,Params.ground_res)*Params.view_radius,
     indexing='xy'
 )
 GRID_OFFSETS = jnp.stack([GRID_OFFSETS[0].ravel(), GRID_OFFSETS[1].ravel()], -1)
 
 @jax.jit
+
 def reset(key: jnp.ndarray, params: Params):
     """
-    Reset environment state and return initial observations.
+    JIT-compiled reset: generates a new Perlin map and initial state.
+    Returns obs, state.
     """
-    key, subkey = jax.random.split(key)
-    perlin_fn = Perlin2D(params.world_radius, params.view_radius)
-
+    # RNG splits
+    key, sk1, sk2 = jax.random.split(key, 3)
+    # Generate heightmap via JAX
+    key, heightmap = generate_fractal_noise_2d(
+        sk1,
+        (params.map_size, params.map_size),
+        res=(8,8),
+        octaves=params.perlin_octaves
+    )
     # Sample positions and velocities
-    pk, vk, tk, xk = jax.random.split(subkey, 4)
-    pos = jax.random.uniform(pk, (params.num_drones, 3), -params.world_radius, params.world_radius)
-    vel = jax.random.uniform(vk, (params.num_drones, 3), params.min_speed, params.max_speed)
+    pos = jax.random.uniform(sk2, (params.num_drones,3),
+                             -params.world_radius, params.world_radius)
+    vk = jax.random.PRNGKey(key[0].astype(jnp.int32))
+    vel = jax.random.uniform(vk, (params.num_drones,3),
+                             params.min_speed, params.max_speed)
     vnorm = jnp.linalg.norm(vel, axis=1, keepdims=True)
-    vel = vel * (jnp.clip(vnorm, params.min_speed, params.max_speed) / (vnorm + 1e-8))
+    vel = vel * (jnp.clip(vnorm, params.min_speed, params.max_speed)/(vnorm+1e-8))
 
-    # Assign teams and PoIs
+    # Teams & POIs
+    tk, xk = jax.random.split(key)
     teams = jax.random.randint(tk, (params.num_drones,), 0, params.num_teams)
-    poi_xy = jax.random.uniform(xk, (params.num_poi, 2), -params.world_radius, params.world_radius)
-    poi = jnp.concatenate([poi_xy, perlin_fn(poi_xy)[:, None]], axis=-1)
+    poi_xy = jax.random.uniform(xk, (params.num_poi,2),
+                                -params.world_radius, params.world_radius)
+    poi = jnp.concatenate([poi_xy,
+                            interpolate_heightmap(
+                                heightmap, poi_xy,
+                                (2*params.world_radius,2*params.world_radius)
+                            )[:,None]
+                           ], axis=-1)
 
-    alive = jnp.ones(params.num_drones, dtype=bool)
-    state = (pos, vel, alive, teams, poi, perlin_fn, 0, key)
-    obs, _ = get_obs(state, params), state
+    alive = jnp.ones(params.num_drones, bool)
+    state = (pos, vel, alive, teams, poi, heightmap, 0, key)
+    obs = get_obs(state, params)
     return obs, state
 
 @jax.jit
