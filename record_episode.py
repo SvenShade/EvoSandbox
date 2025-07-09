@@ -18,6 +18,23 @@ from typing import Any, Tuple
 import chex
 import flax
 
+# ------------------------------------------------------------------------------
+# Actor apply wrapper: adds {"params": …} and disables training-time features
+# Place after actor_network in run_experiment.
+# ------------------------------------------------------------------------------
+def actor_apply(params, obs, *, key=None):
+    """Pure inference: returns a distrax distribution."""
+    rngs = {"dropout": key} if key is not None else None
+    # train=False → no dropout, no batch-norm updates
+    return actor_network.apply({"params": params},
+                               obs,
+                               train=False,
+                               rngs=rngs)
+
+# jit for speed because we'll call it ~horizon×agents times in GIF loop
+actor_apply = jax.jit(actor_apply, static_argnames=())  # no static args
+
+
 
 # Patch env.render(state) onto an environment.
 def _attach_mpe_render(env):
