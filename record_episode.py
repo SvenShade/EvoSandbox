@@ -91,6 +91,9 @@ _attach_mpe_render(env)
 _attach_mpe_render(eval_env)
 
 
+# ────────────────────────────────────────────────────────────────────────────────
+# GIF-recording utility
+# ────────────────────────────────────────────────────────────────────────────────
 def record_episode_gif(
     env: MarlEnv,
     actor_apply_fn: ActorApply,
@@ -100,16 +103,24 @@ def record_episode_gif(
     fps: int,
     seed: int,
     out_path: Path,
-    greedy: bool = True,          # NEW ─ follow arch.evaluation_greedy
+    greedy: bool = True,
 ) -> None:
-    …
+    """
+    Runs a single episode with `actor_params` in `env` and saves the RGB frames
+    to `out_path` as an animated GIF.  Works on CPU; no JIT / grad required.
+    """
+    # Reset environment
     key = jax.random.PRNGKey(seed)
     env_state, timestep = env.reset(key)
 
     frames: list[np.ndarray] = []
+
+    # Render the first frame
     frames.append(np.asarray(env.render(env_state)).astype(np.uint8))
 
-    step, done = 0, jnp.any(timestep.last())
+    step = 0
+    done = jnp.any(timestep.last())
+
     while (not done) and step < max_steps:
          policy_dist = actor_apply_fn(actor_params, timestep.observation)
          if greedy:
@@ -123,6 +134,10 @@ def record_episode_gif(
 
         done, step = jnp.any(timestep.last()), step + 1
 
+    # Write GIF
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    imageio.mimsave(out_path, frames, fps=fps)
+    print(f"[GIF] Saved episode ({len(frames)} frames) → {out_path.resolve()}")
 
 
 # Insert before return_eval():
