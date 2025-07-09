@@ -19,66 +19,44 @@ import chex
 import flax
 
 
-# ───────────────────────────────────────────────────────────────────────────────
-# MPE-style single-frame renderer (borrowed from mpe_visualizer.py)
-# ───────────────────────────────────────────────────────────────────────────────
-ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-
+# Patch env.render(state) onto an environment.
 def _attach_mpe_render(env):
-    """Monkey-patch `env.render(state)` onto an MPE environment.
-
-    The first call lazily builds the matplotlib artists; subsequent calls just
-    update them and grab the RGB buffer → np.ndarray[H,W,3] (uint8)."""
     # Cache objects on the env instance itself so they persist across calls
     env._render_setup_done = False
-
-    def _render(state):
-        # 1️⃣ Lazy initialisation ------------------------------------------------
-        if not env._render_setup_done:
+    def _render(self, state):
+        # Lazy initialisation.
+        if not getattr(self, "_render_setup_done", False):
             # Figure / axes
-            env._fig, env._ax = plt.subplots(figsize=(5, 5), dpi=100)
-            env._ax.set_xlim([-2, 2])
-            env._ax.set_ylim([-2, 2])
-            env._ax.set_aspect("equal")
-            env._ax.axis("off")
-
-            # Entity circles
-            env._entity_patches = []
-            for i in range(env.num_entities):
+            self._fig, self._ax = plt.subplots(figsize=(5, 5), dpi=100)
+            self._ax.set_xlim([-2, 2])
+            self._ax.set_ylim([-2, 2])
+            self._ax.set_aspect("equal")
+            self._ax.axis("off")
+    
+            # Entities.
+            self._entity_patches = []
+            for i in range(self.num_entities):
                 patch = Circle(
                     (0, 0),
-                    radius=env.rad[i],
-                    color=np.asarray(env.colour[i]) / 255.0,
+                    radius=self.rad[i],
+                    color=np.asarray(self.colour[i]) / 255.0,
                 )
-                env._ax.add_patch(patch)
-                env._entity_patches.append(patch)
-
-            # Step counter text
-            env._step_txt = env._ax.text(-1.9, 1.9, "", va="top", fontsize=9)
-
-            # Optional comm text
-            env._comm_idx = np.where(env.silent == 0)[0] if not np.all(env.silent) else []
-            env._comm_txt = []
-            for j, idx in enumerate(env._comm_idx):
-                txt = env._ax.text(-1.9, -1.9 + j * 0.17, "", fontsize=8)
-                env._comm_txt.append(txt)
-
-            env._render_setup_done = True
-
-        # 2️⃣ Update artists -----------------------------------------------------
-        for i, patch in enumerate(env._entity_patches):
+                self._ax.add_patch(patch)
+                self._entity_patches.append(patch)
+    
+            # Step counter.
+            self._step_txt = self._ax.text(-1.9, 1.9, "", va="top", fontsize=9)    
+            self._render_setup_done = True
+    
+        # Update artists.
+        for i, patch in enumerate(self._entity_patches):
             patch.center = state.p_pos[i]
-
-        env._step_txt.set_text(f"Step: {state.step}")
-
-        for j, idx in enumerate(env._comm_idx):
-            letter = ALPHABET[np.argmax(state.c[idx])]
-            env._comm_txt[j].set_text(f"{env.agents[idx]} sends {letter}")
-
-        # 3️⃣ Rasterise and return np array --------------------------------------
-        env._fig.canvas.draw()
-        w, h = env._fig.canvas.get_width_height()
-        rgb = np.frombuffer(env._fig.canvas.tostring_rgb(), dtype=np.uint8)
+        self._step_txt.set_text(f"Step: {state.step}")
+    
+        # Render.
+        self._fig.canvas.draw()
+        w, h = self._fig.canvas.get_width_height()
+        rgb = np.frombuffer(self._fig.canvas.tostring_rgb(), dtype=np.uint8)
         return rgb.reshape(h, w, 3)
 
     # Bind method
