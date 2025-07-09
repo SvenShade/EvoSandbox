@@ -23,13 +23,16 @@ import flax
 # Place after actor_network in run_experiment.
 # ------------------------------------------------------------------------------
 def actor_apply(params, obs, *, key=None):
-    """Pure inference: returns a distrax distribution."""
+    # Accept either raw params OR a full variables dict
+    if "params" in param_tree:           # already a full variables dict
+        variables = param_tree
+    else:                                # raw params → wrap once
+        variables = {"params": param_tree}
+
     rngs = {"dropout": key} if key is not None else None
-    # train=False → no dropout, no batch-norm updates
-    return actor_network.apply({"params": params},
-                               obs,
-                               train=False,
-                               rngs=rngs)
+    return actor_network.apply(
+        variables, obs, train=False, rngs=rngs
+    )
 
 # jit for speed because we'll call it ~horizon×agents times in GIF loop
 actor_apply = jax.jit(actor_apply, static_argnames=())  # no static args
