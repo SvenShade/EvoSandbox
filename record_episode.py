@@ -55,9 +55,10 @@ def _attach_mpe_render(env):
     
         # Render.
         self._fig.canvas.draw()
-        w, h = self._fig.canvas.get_width_height()
-        rgb = np.frombuffer(self._fig.canvas.tostring_rgb(), dtype=np.uint8)
-        return rgb.reshape(h, w, 3)
+        w, h = self._fig.canvas.get_width_height()        
+        rgb = np.asarray(self._fig.canvas.buffer_rgba()) # (h*w*4)
+        rgb = rgb.reshape(h, w, 4)[..., :3]
+        return rgb.copy() 
 
     # Bind method
     import types
