@@ -18,26 +18,6 @@ from typing import Any, Tuple
 import chex
 import flax
 
-# ------------------------------------------------------------------------------
-# Actor apply wrapper: adds {"params": …} and disables training-time features
-# Place after actor_network in run_experiment.
-# ------------------------------------------------------------------------------
-def actor_apply(params, obs, *, key=None):
-    # Accept either raw params OR a full variables dict
-    if "params" in param_tree:           # already a full variables dict
-        variables = param_tree
-    else:                                # raw params → wrap once
-        variables = {"params": param_tree}
-
-    rngs = {"dropout": key} if key is not None else None
-    return actor_network.apply(
-        variables, obs, train=False, rngs=rngs
-    )
-
-# jit for speed because we'll call it ~horizon×agents times in GIF loop
-actor_apply = jax.jit(actor_apply, static_argnames=())  # no static args
-
-
 
 # Patch env.render(state) onto an environment.
 def _attach_mpe_render(env):
@@ -86,7 +66,6 @@ def _attach_mpe_render(env):
 
 
 # Attach head-less renderers so record_episode_gif() works, immediately after env, eval_env = environments.make(config)
-_attach_mpe_render(env)
 _attach_mpe_render(eval_env)
 
 
@@ -121,7 +100,14 @@ def record_episode_gif(
     done = jnp.any(timestep.last())
 
     while (not done) and step < max_steps:
-         policy_dist = actor_apply_fn(actor_params, timestep.observation)
+        # Make obs shape (1, num_agents, obs_dim) so it matches training time
+        batched_obs = jax.tree_map(lambda x: x[jnp.newaxis, ...], timestep.observation)
+        policy_dist = actor_apply_fn(actor_params, batched_obs)
+        # policy_dist has a leading env-axis of size 1; strip it off again
+        policy_dist = jax.tree_map(lambda d: jax.tree_util.tree_leaves(d)[0]
+                                   if hasattr(d, "event_shape") else d[0],
+                                   policy_dist)
+        
          if greedy:
              action = policy_dist.mode()            # deterministic
          else:                                      # stochastic like Quick-start
