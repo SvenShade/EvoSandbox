@@ -19,30 +19,7 @@ import chex
 import flax
 
 
-# best_params or trained_params from your checkpoint
-full_tree      = best_params if config.arch.absolute_metric else trained_params
-actor_raw_tree = full_tree["params"]["policy"]    # <─ strip *two* levels
-
-pi = actor_network.apply(actor_raw_tree, batched_obs, train=False)
-
-
-# ---------------------------------------------------------------------------
-# Inside record_gif:
-# Build the exact param tree the actor expects (strip "params" and "policy")
-full_tree      = actor_params                     # what came from run_experiment
-actor_params   = full_tree["params"]["policy"]    # two-level strip
-
-# keep env batch axis: (1, num_agents, obs_dim)
-batched_obs = jax.tree_map(lambda x: x[jnp.newaxis, ...], timestep.observation)
-
-# Forward pass (no extra {"params": …} wrapper!)
-pi = actor_apply_fn(actor_params, batched_obs, train=False)
-
-# Drop the env axis again
-pi = pi.squeeze(axis=0)
-
-action = pi.mode() if greedy else pi.sample(seed=action_key)
-
+print(jax.tree_util.tree_flatten(policy_params)[1][:20])  # first 20 paths
 
 
 # Patch env.render(state) onto an environment.
