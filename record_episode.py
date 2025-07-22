@@ -15,39 +15,33 @@ init_x = tree.map(_preprocess_init_obs, obs)
 actor_params = actor_network.init(actor_net_key, init_x)
 
 
-# After all training and evaluation, run a final episode to collect states.
-print(f"{Fore.BLUE}{Style.BRIGHT}\nRunning final episode to collect states...{Style.RESET_ALL}")
+ print(f"{Fore.BLUE}{Style.BRIGHT}\nRunning final episode to collect states...{Style.RESET_ALL}")
 
-# Use the best parameters if they exist, otherwise use the last trained parameters.
-final_params = (
-    best_params if config.arch.absolute_metric and best_params is not None else trained_params
-)
-key_e, final_run_key = jax.random.split(key_e)
+    # Use the best parameters if they exist, otherwise use the last trained parameters.
+    final_params = (
+        best_params if config.arch.absolute_metric and best_params is not None else trained_params
+    )
+    key_e, final_run_key = jax.random.split(key_e)
 
-# Reset the evaluation environment.
-state, timestep = eval_env.reset(final_run_key)
-done = False
-episode_states = [state]
+    # Reset the evaluation environment.
+    state, timestep = eval_env.reset(final_run_key)
+    done = False
+    episode_states = [state]
 
-while not done:
-    key_e, act_key = jax.random.split(key_e)
+    while not done:
+        key_e, act_key = jax.random.split(key_e)
 
-    # Add a batch dimension to the observation for the actor network.
-    obs_b = jax.tree_util.tree_map(lambda x: x[jnp.newaxis, :], timestep.observation)
+        # Select an action by passing the entire timestep object.
+        # The eval_act_fn wrapper handles extracting the observation and batching.
+        action = eval_act_fn(final_params, timestep, act_key)
 
-    # Select an action.
-    action = eval_act_fn(final_params, obs_b, act_key)
+        # Step the environment.
+        state, timestep = eval_env.step(state, action)
+        episode_states.append(state)
 
-    # Remove the batch dimension from the action before stepping the environment.
-    action = jax.tree_util.tree_map(lambda x: x.squeeze(0), action)
+        # Check if the episode has terminated.
+        done = timestep.last()
 
-    # Step the environment.
-    state, timestep = eval_env.step(state, action)
-    episode_states.append(state)
-
-    # Check if the episode has terminated.
-    done = timestep.last()
-
-print(
-    f"{Fore.GREEN}Collected {len(episode_states)} states from the final episode.{Style.RESET_ALL}"
-)
+    print(
+        f"{Fore.GREEN}Collected {len(episode_states)} states from the final episode.{Style.RESET_ALL}"
+    )
