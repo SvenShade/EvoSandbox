@@ -1,24 +1,98 @@
-@jax.jit
-    def final_act_fn(params: chex.ArrayTree, observation: chex.ArrayTree, key: chex.PRNGKey) -> chex.Array:
-        """
-        Manually vmaps the torso over the agents dimension to correctly handle
-        the lifted 3D parameters.
-        """
-        # Extract the parameters for the torso and action_head.
-        torso_params = params['params']['torso']
-        action_head_params = params['params']['action_head']
+# Copyright 2022 InstaDeep Ltd. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-        # Vmap the torso's apply function. This tells JAX to apply the torso
-        # to each agent's observation slice in the (3, 18) agents_view,
-        # while using the corresponding slice from the (1, 18, 128) kernel.
-        vmapped_torso_apply = jax.vmap(
-            actor_torso.apply, in_axes=(None, 0), out_axes=0
+# ==============================================================================
+# ADD THE FOLLOWING IMPORTS TO THE TOP OF ff_ippo.py
+# ==============================================================================
+from mava.networks import Actor
+from mava.utils import make_env as environments
+
+# ==============================================================================
+# ADD THIS FUNCTION DEFINITION WITHIN ff_ippo.py
+# (e.g., after the get_learner_fn or learner_setup function)
+# ==============================================================================
+
+
+def final_episode(config: DictConfig, params: FrozenDict, actor_network: Actor) -> None:
+    """Run a final episode of the trained policy and collect states.
+
+    Args:
+        config: System configuration.
+        params: Trained actor network parameters.
+        actor_network: The actor network instance.
+    """
+    # Add the following to your hydra config to enable this functionality:
+    # arch:
+    #   run_final_episode: True
+
+    print(f"{Fore.CYAN}{Style.BRIGHT}Running final episode with trained policy...{Style.RESET_ALL}")
+
+    # Create a single environment for the final episode.
+    # We cannot use the env from the learner as it is vmapped.
+    final_env, _ = environments.make(config, add_global_state=False, num_envs=1)
+
+    apply_fn = actor_network.apply
+    reset_fn = jax.jit(final_env.reset)
+    step_fn = jax.jit(final_env.step)
+    key = jax.random.PRNGKey(config.system.seed)
+
+    key, reset_key = jax.random.split(key)
+    state, timestep = reset_fn(reset_key)
+
+    states = [state]
+    episode_return = 0.0
+    episode_length = 0
+
+    while not timestep.last():
+        key, action_key = jax.random.split(key)
+        pi = apply_fn(params, timestep.observation)
+
+        if config.arch.evaluation_greedy:
+            action = pi.mode()
+        else:
+            action = pi.sample(seed=action_key)
+
+        state, timestep = step_fn(state, action)
+        states.append(state)
+        episode_return += jnp.mean(timestep.reward)
+        episode_length += 1
+
+    print("Final Episode:")
+    print(f"  Return: {episode_return}")
+    print(f"  Length: {episode_length}")
+    print(f"  Collected {len(states)} states.")
+
+
+# ==============================================================================
+# IN THE `run_experiment` FUNCTION, ADD THE FOLLOWING CODE BLOCK
+# JUST BEFORE THE FINAL `return eval_performance` STATEMENT.
+# ==============================================================================
+"""
+    # ... existing code ...
+    # Stop the logger.
+    logger.stop()
+
+    # Run a final episode.
+    if config.arch.get("run_final_episode", False):
+        # Use best params if available, otherwise use final params.
+        final_params = (
+            best_params
+            if config.arch.absolute_metric and best_params is not None
+            else trained_params
         )
-        obs_embedding = vmapped_torso_apply({'params': torso_params}, observation.agents_view)
+        final_episode(config, final_params, actor_network)
 
-        # Call the action_head with the now correctly shaped embeddings.
-        pi = actor_action_head.apply({'params': action_head_params}, obs_embedding, observation.action_mask)
-        
-        # Sample an action.
-        action = pi.sample(seed=key)
-        return action
+
+    return eval_performance
+"""
