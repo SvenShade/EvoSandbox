@@ -9,6 +9,17 @@ except ModuleNotFoundError:
         pass
 
 
+@@ def learner_setup(...):
+-    # Initialise observation with obs of all agents.
+-    obs = env.observation_spec.generate_value()
+-    init_x = tree.map(lambda x: x[jnp.newaxis, ...], obs)      # ❌ adds wrong axis
++    # Initialise observation with obs of all agents.
++    obs          = env.observation_spec.generate_value()       # (num_agents, obs_dim)
++    num_envs     = config.arch.num_envs
++    # Broadcast so the shape matches run‑time: (num_envs, num_agents, obs_dim)
++    init_x       = tree.map(lambda x: jnp.broadcast_to(x, (num_envs,) + x.shape), obs)
+
+
 def _render_single_episode(
     env: MarlEnv,
     actor_apply_fn: ActorApply,
