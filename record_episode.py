@@ -1,8 +1,7 @@
 # --- Start of inserted code ---
     print(f"{Fore.BLUE}{Style.BRIGHT}\nRunning final episode to collect states...{Style.RESET_ALL}")
 
-    # 1. Re-instantiate the Actor network to get a clean object for JIT compilation.
-    # This is the approach used in Mava's official Quickstart notebook.
+    # Re-instantiate the Actor network to ensure a clean state for JIT compilation.
     actor_torso = hydra.utils.instantiate(config.network.actor_network.pre_torso)
     action_head, _ = get_action_head(eval_env.action_spec)
     actor_action_head = hydra.utils.instantiate(action_head, action_dim=eval_env.action_dim)
@@ -11,17 +10,28 @@
     # Get the trained actor parameters from a single device.
     final_params = unreplicate_batch_dim(learner_state.params.actor_params)
 
-    # 2. Define a jit-compiled action function using the clean network.
+    # Define the JIT-compiled action function.
     @jax.jit
     def final_act_fn(params: chex.ArrayTree, observation: chex.ArrayTree, key: chex.PRNGKey) -> chex.Array:
-        """A clean action function for a single, unbatched observation."""
-        # Pass the raw, unbatched observation directly to the network's apply function.
-        # The network is designed to handle this 2D (num_agents, features) input.
-        pi = clean_actor_network.apply(params, observation)
-        action = pi.sample(seed=key)
-        return action
+        """
+        Action function for a single step. It adds a batch dimension to the observation
+        for the network and removes the batch dimension from the resulting action.
+        """
+        # Add a leading batch dimension to the observation PyTree.
+        # e.g., (num_agents, features) -> (1, num_agents, features)
+        batched_observation = jax.tree_util.tree_map(lambda x: x[jnp.newaxis, ...], observation)
 
-    # --- Run the episode using the new action function ---
+        # Get the policy distribution from the network.
+        pi = clean_actor_network.apply(params, batched_observation)
+
+        # Sample an action.
+        action = pi.sample(seed=key)
+
+        # Remove the leading batch dimension from the action to match the environment's expectation.
+        # e.g., (1, num_agents, action_dim) -> (num_agents, action_dim)
+        return jax.tree_util.tree_map(lambda x: x.squeeze(0), action)
+
+    # --- Run the episode ---
     key_e, final_run_key = jax.random.split(key_e)
     state, timestep = eval_env.reset(final_run_key)
     done = False
@@ -29,14 +39,14 @@
 
     while not done:
         key_e, act_key = jax.random.split(key_e)
-        
-        # Get an action from our new function using the timestep's raw observation.
+
+        # Get an action from our new function.
         action = final_act_fn(final_params, timestep.observation, act_key)
-        
+
         # Step the environment.
         state, timestep = eval_env.step(state, action)
         episode_states.append(state)
-        
+
         done = timestep.last()
 
     print(
