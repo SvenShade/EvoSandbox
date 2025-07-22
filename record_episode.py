@@ -2,6 +2,7 @@
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
+# You may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -40,7 +41,7 @@ def final_episode(config: DictConfig, params: FrozenDict, actor_network: Actor) 
 
     # Create a single environment for the final episode.
     # We cannot use the env from the learner as it is vmapped.
-    final_env, _ = environments.make(config, add_global_state=False, num_envs=1)
+    final_env, _ = environments.make(config, add_global_state=False)
 
     apply_fn = actor_network.apply
     reset_fn = jax.jit(final_env.reset)
@@ -56,12 +57,19 @@ def final_episode(config: DictConfig, params: FrozenDict, actor_network: Actor) 
 
     while not timestep.last():
         key, action_key = jax.random.split(key)
-        pi = apply_fn(params, timestep.observation)
+        # Add a batch dimension to the observation before passing it to the network.
+        observation_with_batch = jax.tree_util.tree_map(
+            lambda x: x[jnp.newaxis, ...], timestep.observation
+        )
+        pi = apply_fn(params, observation_with_batch)
 
         if config.arch.evaluation_greedy:
             action = pi.mode()
         else:
             action = pi.sample(seed=action_key)
+
+        # Remove the batch dimension from the action before passing it to the environment.
+        action = action.squeeze(0)
 
         state, timestep = step_fn(state, action)
         states.append(state)
