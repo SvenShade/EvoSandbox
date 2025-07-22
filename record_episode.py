@@ -1,38 +1,45 @@
-    # --- Start of Final Diagnostic Code ---
-    print(f"{Fore.MAGENTA}{Style.BRIGHT}\n--- Starting Final Diagnostic Step ---{Style.RESET_ALL}")
+# --- Start of inserted code ---
+    print(f"{Fore.BLUE}{Style.BRIGHT}\nRunning final episode to collect states...{Style.RESET_ALL}")
 
-    try:
-        # 1. Get the trained parameters and a key.
-        final_params = unreplicate_batch_dim(learner_state.params.actor_params)
-        key_e, reset_key, act_key = jax.random.split(key_e, 3)
+    # 1. Re-instantiate the Actor network to get a clean object for JIT compilation.
+    # This is the approach used in Mava's official Quickstart notebook.
+    actor_torso = hydra.utils.instantiate(config.network.actor_network.pre_torso)
+    action_head, _ = get_action_head(eval_env.action_spec)
+    actor_action_head = hydra.utils.instantiate(action_head, action_dim=eval_env.action_dim)
+    clean_actor_network = Actor(torso=actor_torso, action_head=actor_action_head)
 
-        # 2. Get a single, unbatched observation from the environment.
-        _, timestep = eval_env.reset(reset_key)
-        observation_to_test = timestep.observation
-        print("Shape of observation from single environment:")
-        print(jax.tree_map(lambda x: x.shape, observation_to_test))
+    # Get the trained actor parameters from a single device.
+    final_params = unreplicate_batch_dim(learner_state.params.actor_params)
 
-        # 3. Manually add a batch dimension of 1.
-        # This replicates the condition that causes the error.
-        batched_observation = jax.tree_util.tree_map(lambda x: x[jnp.newaxis, ...], observation_to_test)
-        print("\nShape of observation after manually adding batch dimension:")
-        print(jax.tree_map(lambda x: x.shape, batched_observation))
+    # 2. Define a jit-compiled action function using the clean network.
+    @jax.jit
+    def final_act_fn(params: chex.ArrayTree, observation: chex.ArrayTree, key: chex.PRNGKey) -> chex.Array:
+        """A clean action function for a single, unbatched observation."""
+        # Pass the raw, unbatched observation directly to the network's apply function.
+        # The network is designed to handle this 2D (num_agents, features) input.
+        pi = clean_actor_network.apply(params, observation)
+        action = pi.sample(seed=key)
+        return action
 
-        # 4. Attempt the single failing operation.
-        # We use the original actor_network object from the trainer.
-        print("\nAttempting to call actor_network.apply()...")
-        pi = actor_network.apply(final_params, batched_observation)
-        action = pi.sample(seed=act_key)
+    # --- Run the episode using the new action function ---
+    key_e, final_run_key = jax.random.split(key_e)
+    state, timestep = eval_env.reset(final_run_key)
+    done = False
+    episode_states = [state]
+
+    while not done:
+        key_e, act_key = jax.random.split(key_e)
         
-        print(f"{Fore.GREEN}Call to actor_network.apply() was SUCCESSFUL.{Style.RESET_ALL}")
-        print("Sampled action shapes:")
-        print(jax.tree_map(lambda x: x.shape, action))
+        # Get an action from our new function using the timestep's raw observation.
+        action = final_act_fn(final_params, timestep.observation, act_key)
+        
+        # Step the environment.
+        state, timestep = eval_env.step(state, action)
+        episode_states.append(state)
+        
+        done = timestep.last()
 
-    except Exception as e:
-        print(f"\n{Fore.RED}Call to actor_network.apply() FAILED with error:{Style.RESET_ALL}")
-        # Print the full traceback for the error from this specific call
-        import traceback
-        traceback.print_exc()
-
-    print(f"{Fore.MAGENTA}--- End of Diagnostic Step ---{Style.RESET_ALL}")
-    # --- End of Final Diagnostic Code ---
+    print(
+        f"{Fore.GREEN}Collected {len(episode_states)} states from the final episode.{Style.RESET_ALL}"
+    )
+    # --- End of inserted code ---
