@@ -1,18 +1,35 @@
 # Initialise observation with obs of all agents.
 obs = env.observation_spec.generate_value()
 
-# Preprocess the dummy observation to ensure it has the correct shape.
-def _preprocess_init_obs(x: chex.Array) -> chex.Array:
-    """Add a batch dim and flatten the remaining dimensions."""
-    # Add a batch dimension: (num_agents, features) -> (1, num_agents, features)
-    x = x[jnp.newaxis, ...]
-    # Flatten agent and feature dimensions: (1, num_agents, features) -> (1, num_agents * features)
-    return x.reshape((x.shape[0], -1))
+# --- Create init data for the centralized critic ---
+# The critic sees the flattened observations of all agents.
+def _preprocess_critic_init_obs(x: chex.Array) -> chex.Array:
+    """Adds a batch dim and flattens all other dims for the centralized critic."""
+    # Input shape e.g.: (3, 18) -> (1, 3, 18)
+    x_batched = x[jnp.newaxis, ...]
+    # Output shape e.g.: (1, 3, 18) -> (1, 54)
+    return x_batched.reshape((x_batched.shape[0], -1))
 
-init_x = tree.map(_preprocess_init_obs, obs)
+critic_init_x = tree.map(_preprocess_critic_init_obs, obs)
+
+# --- Create init data for the independent actor ---
+# The actor sees the observation of a single agent.
+# We take the obs for the first agent and add a batch dimension.
+# Input shape e.g.: (3, 18) -> (18,)
+single_agent_obs = jax.tree_util.tree_map(lambda x: x[0], obs)
+# Output shape e.g.: (18,) -> (1, 18)
+actor_init_x = jax.tree_util.tree_map(lambda x: x[jnp.newaxis, ...], single_agent_obs)
+
 
 # Initialise actor params and optimiser state.
-actor_params = actor_network.init(actor_net_key, init_x)
+# The actor expects input for a single agent, e.g. shape (1, 18)
+actor_params = actor_network.init(actor_net_key, actor_init_x)
+actor_opt_state = actor_optim.init(actor_params)
+
+# Initialise critic params and optimiser state.
+# The critic expects the full centralized input, e.g. shape (1, 54)
+critic_params = critic_network.init(critic_net_key, critic_init_x)
+critic_opt_state = critic_optim.init(critic_params)
 
 
  print(f"{Fore.BLUE}{Style.BRIGHT}\nRunning final episode to collect states...{Style.RESET_ALL}")
