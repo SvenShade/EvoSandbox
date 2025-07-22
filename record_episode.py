@@ -18,7 +18,7 @@
         action = pi.sample(seed=key)
         return action
 
-    # --- Set up and run two parallel environments to avoid batch size 1 ---
+    # --- Set up and run two parallel environments to avoid batch size 1 issue ---
     num_parallel_runs = 2
     vmapped_env_reset = jax.vmap(eval_env.reset)
     vmapped_env_step = jax.vmap(eval_env.step)
@@ -30,16 +30,18 @@
     # Reset the batch of environments.
     states, timesteps = vmapped_env_reset(keys)
 
-    # Store states for each of the parallel runs.
-    episode_states_batch = [[s] for s in jax.tree_util.tree_unstack(states)]
+    # CORRECTED LINE: Unstack the initial states into a list, one for each parallel run.
+    initial_states_list = [jax.tree_util.tree_map(lambda x: x[i], states) for i in range(num_parallel_runs)]
+    # Initialize a list of lists to store the episode states for each run.
+    episode_states_batch = [[s] for s in initial_states_list]
+    
     dones = jnp.zeros(num_parallel_runs, dtype=bool)
 
     while not jnp.all(dones):
         key_e, act_key = jax.random.split(key_e)
         act_keys = jax.random.split(act_key, num_parallel_runs)
 
-        # Get actions for the batch of environments. The observation already has a leading
-        # batch dimension of 2, which avoids the error.
+        # Get actions for the batch of environments.
         actions = batch_act_fn(final_params, timesteps.observation, act_keys)
 
         # Step the batch of environments.
