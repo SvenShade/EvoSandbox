@@ -2,7 +2,6 @@
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
-# You may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -16,8 +15,16 @@
 # ==============================================================================
 # ADD THE FOLLOWING IMPORTS TO THE TOP OF ff_ippo.py
 # ==============================================================================
+import jax
+import jax.numpy as jnp
+import jax.tree_util
+from colorama import Fore, Style
+from flax.core.frozen_dict import FrozenDict
+from omegaconf import DictConfig
+
 from mava.networks import Actor
 from mava.utils import make_env as environments
+from mava.utils.jax_utils import unreplicate_n_dims
 
 # ==============================================================================
 # ADD THIS FUNCTION DEFINITION WITHIN ff_ippo.py
@@ -30,7 +37,7 @@ def final_episode(config: DictConfig, params: FrozenDict, actor_network: Actor) 
 
     Args:
         config: System configuration.
-        params: Trained actor network parameters.
+        params: Trained actor network parameters. Must be unreplicated.
         actor_network: The actor network instance.
     """
     # Add the following to your hydra config to enable this functionality:
@@ -99,6 +106,8 @@ def final_episode(config: DictConfig, params: FrozenDict, actor_network: Actor) 
             if config.arch.absolute_metric and best_params is not None
             else trained_params
         )
+        # Unreplicate the device dimension before passing to the non-pmapped function.
+        final_params = unreplicate_n_dims(final_params, unreplicate_depth=1)
         final_episode(config, final_params, actor_network)
 
 
