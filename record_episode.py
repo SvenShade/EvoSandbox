@@ -1,3 +1,20 @@
+# Initialise observation with obs of all agents.
+obs = env.observation_spec.generate_value()
+
+# Preprocess the dummy observation to ensure it has the correct shape.
+def _preprocess_init_obs(x: chex.Array) -> chex.Array:
+    """Add a batch dim and flatten the remaining dimensions."""
+    # Add a batch dimension: (num_agents, features) -> (1, num_agents, features)
+    x = x[jnp.newaxis, ...]
+    # Flatten agent and feature dimensions: (1, num_agents, features) -> (1, num_agents * features)
+    return x.reshape((x.shape[0], -1))
+
+init_x = tree.map(_preprocess_init_obs, obs)
+
+# Initialise actor params and optimiser state.
+actor_params = actor_network.init(actor_net_key, init_x)
+
+
 # After all training and evaluation, run a final episode to collect states.
 print(f"{Fore.BLUE}{Style.BRIGHT}\nRunning final episode to collect states...{Style.RESET_ALL}")
 
