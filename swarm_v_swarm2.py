@@ -1,358 +1,359 @@
-"""
-Swarm-v-Swarm MPE scenario for JaxMARL (single class, no env collision forces).
-
-Action per agent: [ax, ay, fire_bit] in [-1, 1]
-  ax, ay -> throttle (scaled by per-agent accel)
-  fire_bit > 0.5 -> fire attempt (costs battery; AoE requires >=2 shooters)
-
-Episode ends at max_steps or when one team is wiped.
-"""
-
-from functools import partial
-from typing import Dict, Tuple, Optional
-
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Dict, Tuple, Any
 import chex
 import jax
 import jax.numpy as jnp
-from flax import struct
 
-from jaxmarl.environments.mpe.default_params import DT, MAX_STEPS, DAMPING
-from jaxmarl.environments.spaces import Box
-from jaxmarl.environments.multi_agent_env import MultiAgentEnv
+# CONFIG
+
+@dataclass(frozen=True)
+class EnvConfig:
+    n_agents: int
+    team_ids: jnp.ndarray               # shape [N], int32 team id per agent
+    mass: jnp.ndarray                   # [N]
+    moveable: jnp.ndarray               # [N] 0/1
+    radius: jnp.ndarray                 # [N]
+    max_speed: float
+    damping: float
+    dt: float
+
+    # Vision / interaction
+    vision_radius: float
+    tag_radius: float
+    fire_radius: float
+    min_shooters_to_kill: int = 2
+
+    # Rewards
+    r_tag_enemy: float = 1.0
+    r_friend_tag_penalty: float = -0.2
+    r_collision_penalty: float = -0.05
+    r_spread: float = 0.1
+
+    # Battery
+    battery_decay_per_step: float = 0.0
+    fire_battery_cost: float = 0.0
+    battery_kill_on_zero: bool = True
+
+    # Episode
+    max_steps: int = 500
+
+    # Debug
+    debug_asserts: bool = False
 
 
-# --------------------------------------------------------------------------- #
-#                                   State                                     #
-# --------------------------------------------------------------------------- #
-
-@struct.dataclass
-class State:
-    p_pos: chex.Array    # [num_entities, 2]
-    p_vel: chex.Array    # [num_entities, 2]
-    done: chex.Array     # [N]
-    step: int
-    active: chex.Array   # [N] bool
-    battery: chex.Array  # [N] float32
+@dataclass
+class EnvState:
+    step: jnp.ndarray                   # ()
+    p_pos: jnp.ndarray                  # [N, 2]
+    p_vel: jnp.ndarray                  # [N, 2]
+    battery: jnp.ndarray                # [N]
+    active: jnp.ndarray                 # [N] bool
+    rng_key: jnp.ndarray                # PRNGKey
 
 
-# --------------------------------------------------------------------------- #
-#                             Swarm-v-Swarm Env                               #
-# --------------------------------------------------------------------------- #
+# UTILITIES
 
-class SwarmVSwarmMPE(MultiAgentEnv):
-    def __init__(
-        self,
-        num_team_a: int = 2,
-        num_team_b: int = 2,
-        num_landmarks: int = 3,
-        # rewards / penalties
-        local_collision_penalty: float = -1.0,
-        spread_reward: float = 1.0,
-        sum_over_landmarks: bool = True,
-        tag_enemy_reward: float = 10.0,
-        tag_friend_penalty: float = -10.0,
-        fire_cost: float = 1.0,
-        fire_radius: float = 0.2,
-        fire_enemy_reward: float = 12.0,
-        fire_friend_penalty: float = -12.0,
-        move_cost_coef: float = 0.2,
-        battery_capacity: float = 5.0,
-        include_battery_in_obs: bool = True,
-        vision_radius: Optional[float] = None,
-        # core env params
-        dim_p: int = 2,
-        max_steps: int = MAX_STEPS,
-        dt: float = DT,
-        # physics overrides
-        **kwargs,
-    ):
-        # sizes & names
-        self.num_team_a = num_team_a
-        self.num_team_b = num_team_b
-        self.N = num_team_a + num_team_b
-        self.L = num_landmarks
-        self.num_entities = self.N + self.L
+def _upper_tri_sum(mat: jnp.ndarray) -> jnp.ndarray:
+    """Sum over upper triangle (i<j) for symmetric pair costs to avoid double counting."""
+    n = mat.shape[0]
+    mask = jnp.triu(jnp.ones((n, n), dtype=bool), k=1)
+    return jnp.sum(jnp.where(mask, mat, 0.0), axis=1)
 
-        self.team_a = [f"a_{i}" for i in range(num_team_a)]
-        self.team_b = [f"b_{i}" for i in range(num_team_b)]
-        self.agents = self.team_a + self.team_b
-        self.landmarks = [f"landmark {i}" for i in range(num_landmarks)]
-        self.a_to_i = {a: i for i, a in enumerate(self.agents)}
+def _vision_mask(dist_sq: jnp.ndarray, vision_sq: float) -> jnp.ndarray:
+    return dist_sq <= vision_sq
 
-        # observation / action spaces (loose upper bound on obs length)
-        obs_dim = (
-            2 + 2                      # self vel, self pos
-            + self.L * 2               # rel landmark pos
-            + (self.N - 1) * 2 * 2     # rel agent pos & vel
-            + 2                        # team one-hot
-            + (1 if include_battery_in_obs else 0)
-        )
-        self.observation_spaces = {a: Box(-jnp.inf, jnp.inf, (obs_dim,)) for a in self.agents}
-        self.action_spaces = {a: Box(-1.0, 1.0, (3,)) for a in self.agents}
+def _broadcast_mask(mask_vec: jnp.ndarray) -> jnp.ndarray:
+    """Turn [N] into [N,1] for broadcasting."""
+    return mask_vec[:, None]
 
-        # env params
-        self.dim_p = dim_p
-        self.max_steps = max_steps
-        self.dt = dt
-        self.include_battery_in_obs = include_battery_in_obs
-        self.vision_sq = None if vision_radius is None else vision_radius ** 2
+def _apply_max_speed(vel: jnp.ndarray, max_speed: float) -> jnp.ndarray:
+    speed = jnp.linalg.norm(vel, axis=-1, keepdims=True)
+    factor = jnp.minimum(1.0, max_speed / (speed + 1e-8))
+    return vel * factor
 
-        # physics params
-        self.rad = kwargs.get(
-            "rad",
-            jnp.concatenate([jnp.full((self.N,), 0.06), jnp.full((self.L,), 0.05)])
-        )
-        self.moveable = kwargs.get(
-            "moveable",
-            jnp.concatenate([jnp.ones((self.N,), dtype=bool), jnp.zeros((self.L,), dtype=bool)])
-        )
-        self.mass = kwargs.get("mass", jnp.full((self.num_entities,), 1.0))
-        self.accel = kwargs.get(
-            "accel",
-            jnp.concatenate([jnp.full((self.num_team_a,), 3.0),
-                             jnp.full((self.num_team_b,), 4.0)])
-        )
-        self.max_speed = kwargs.get(
-            "max_speed",
-            jnp.concatenate([jnp.full((self.N,), 1.2), jnp.full((self.L,), 0.0)])
-        )
-        self.u_noise = kwargs.get("u_noise", jnp.zeros((self.N,)))
-        self.damping = kwargs.get("damping", DAMPING)
+# ENVIRONMENT
 
-        # reward / energy params
-        self.local_collision_penalty = local_collision_penalty
-        self.spread_reward = spread_reward
-        self.sum_over_landmarks = sum_over_landmarks
-        self.tag_enemy_reward = tag_enemy_reward
-        self.tag_friend_penalty = tag_friend_penalty
-        self.fire_cost = fire_cost
-        self.fire_radius_sq = fire_radius ** 2
-        self.fire_enemy_reward = fire_enemy_reward
-        self.fire_friend_penalty = fire_friend_penalty
-        self.move_cost_coef = move_cost_coef
-        self.battery_capacity = battery_capacity
+class SwarmEnv:
+    """
+    MARL swarm vs swarm environment (JAX-friendly).
+    Public API:
+        - reset(key) -> (obs_dict, state)
+        - step_env(state, action_dict) -> (obs_dict, reward_dict, done_dict, info_dict, next_state)
+        - get_obs(state) -> obs_dict
+    """
 
-        # masks / constants
-        self.team_mask_a = jnp.array([True] * num_team_a + [False] * num_team_b)
-        self.team_mask_b = ~self.team_mask_a
-        self.team_feat = jnp.stack(
-            [self.team_mask_a.astype(jnp.float32), self.team_mask_b.astype(jnp.float32)], axis=-1
-        )
-        self.agent_range = jnp.arange(self.N)
-        self.eye_N = jnp.eye(self.N, dtype=bool)
-        self.rad_agents = self.rad[: self.N]
+    def __init__(self, config: EnvConfig):
+        self.cfg = config
+        self.N = config.n_agents
+        chex.assert_shape(config.team_ids, (self.N,))
+        self.teams = config.team_ids
+        self.num_teams = int(jnp.max(self.teams)) + 1
 
-    # ------------------------------------------------------------------ #
-    #                               Reset                                #
-    # ------------------------------------------------------------------ #
-    @partial(jax.jit, static_argnums=0)
-    def reset(self, key: chex.PRNGKey) -> Tuple[Dict[str, chex.Array], State]:
-        key_a, key_l = jax.random.split(key)
-        p_pos = jnp.concatenate(
-            [
-                jax.random.uniform(key_a, (self.N, 2), minval=-1.0, maxval=+1.0),
-                jax.random.uniform(key_l, (self.L, 2), minval=-1.0, maxval=+1.0),
-            ]
-        )
-        state = State(
-            p_pos=p_pos,
-            p_vel=jnp.zeros((self.num_entities, self.dim_p)),
-            done=jnp.zeros((self.N,), dtype=bool),
-            step=0,
+        # Precompute masks
+        self.same_team = (self.teams[:, None] == self.teams[None, :])
+        self.diff_team = ~self.same_team
+
+        # Observation dimension (document clearly)
+        # pos of others (2*N), vel of others (2*N), relative pos/vel optional,
+        # battery (1), team onehot (T), active flag (1)
+        self.team_onehot = jax.nn.one_hot(self.teams, self.num_teams)
+
+        # We'll compute obs shape dynamically to keep code robust.
+        dummy_state = EnvState(
+            step=jnp.array(0, dtype=jnp.int32),
+            p_pos=jnp.zeros((self.N, 2), dtype=jnp.float32),
+            p_vel=jnp.zeros((self.N, 2), dtype=jnp.float32),
+            battery=jnp.ones((self.N,), dtype=jnp.float32),
             active=jnp.ones((self.N,), dtype=bool),
-            battery=jnp.full((self.N,), self.battery_capacity, dtype=jnp.float32),
+            rng_key=jax.random.PRNGKey(0),
         )
-        return self.get_obs(state), state
+        self._obs_example = self._compute_obs_tensor(dummy_state)
+        self.obs_dim = self._obs_example.shape[-1]
 
-    # ------------------------------------------------------------------ #
-    #                                Step                                #
-    # ------------------------------------------------------------------ #
-    @partial(jax.jit, static_argnums=0)
-    def step_env(self, key: chex.PRNGKey, state: State, actions: Dict[str, chex.Array]):
-        raw = jnp.stack([actions[a] for a in self.agents], axis=0)  # [N,3]
-        chex.assert_shape(raw, (self.N, 3))
+        # Wrap jit functions
+        self._reset_jit = jax.jit(self._reset_impl, static_argnums=0)
+        self._step_jit = jax.jit(self._step_impl, static_argnums=0)
+        self._obs_jit  = jax.jit(self._compute_obs_tensor, static_argnums=0)
 
-        throttle = raw[:, :2]
-        fire_bit = raw[:, 2] > 0.5
+    # ------------- Public API -------------
+    def reset(self, rng_key: jnp.ndarray) -> Tuple[Dict[str, jnp.ndarray], EnvState]:
+        obs, state = self._reset_jit(rng_key)
+        return self._obs_to_dict(obs), state
 
-        # physics (agents only)
-        u = throttle * self.accel[:, None]
-        key, key_w = jax.random.split(key)
-        p_pos, p_vel = self._world_step(key_w, state, u)
+    def step_env(self, state: EnvState, action_dict: Dict[str, jnp.ndarray]):
+        # Convert action dict -> array [N, A]
+        actions = self._dict_to_array(action_dict)
+        obs, rew, done, info, next_state = self._step_jit(state, actions)
+        return self._obs_to_dict(obs), self._rew_to_dict(rew), self._done_to_dict(done), info, next_state
 
-        # battery
-        move_cost = self.move_cost_coef * jnp.sum(jnp.abs(throttle), axis=1)
-        can_fire   = state.active & (state.battery >= (self.fire_cost + move_cost))
-        effective_fire = fire_bit & can_fire
-        total_cost = move_cost + self.fire_cost * effective_fire.astype(jnp.float32)
-        new_battery = jnp.maximum(state.battery - total_cost, 0.0)
+    def get_obs(self, state: EnvState) -> Dict[str, jnp.ndarray]:
+        obs = self._obs_jit(state)
+        return self._obs_to_dict(obs)
 
-        # distances
-        p_pos_a = p_pos[: self.N]
-        diff = p_pos_a[:, None, :] - p_pos_a[None, :, :]
-        dist_sq = jnp.sum(diff * diff, axis=-1)
+    # ------------- Internals -------------
 
-        # collision detection (no forces)
-        radii_sum = self.rad_agents[:, None] + self.rad_agents[None, :]
-        coll_mat = (dist_sq < radii_sum ** 2) & (~self.eye_N)
+    def _reset_impl(self, rng_key: jnp.ndarray):
+        key_pos, key_vel, key_bat = jax.random.split(rng_key, 3)
+        # Simple random spawn; customize as needed
+        p_pos = jax.random.uniform(key_pos, (self.N, 2), minval=-1.0, maxval=1.0)
+        p_vel = jax.random.normal(key_vel, (self.N, 2)) * 0.0
+        battery = jnp.ones((self.N,), dtype=jnp.float32)
+        active = jnp.ones((self.N,), dtype=bool)
 
-        # tag: any enemy collision deactivates the victim
-        enemy_pair = (self.team_mask_a[:, None] & self.team_mask_b[None, :]) | \
-                     (self.team_mask_b[:, None] & self.team_mask_a[None, :])
-        tag_hits_enemy = coll_mat & enemy_pair
-        tag_victims = jnp.any(tag_hits_enemy.T, axis=1)
-
-        # fire AoE: victim hit by >=2 shooters
-        aoe_hits = (dist_sq <= self.fire_radius_sq) & (~self.eye_N)
-        aoe_hits = aoe_hits & effective_fire[:, None] & state.active[None, :]
-        shooters_per_victim = jnp.sum(aoe_hits, axis=0)
-        fire_victims = shooters_per_victim >= 2
-
-        # battery death
-        battery_dead = new_battery <= 0.0
-
-        victims = tag_victims | fire_victims | battery_dead
-        new_active = state.active & (~victims)
-
-        # termination
-        team_a_dead = ~jnp.any(new_active[self.team_mask_a])
-        team_b_dead = ~jnp.any(new_active[self.team_mask_b])
-        done_all = team_a_dead | team_b_dead | ((state.step + 1) >= self.max_steps)
-
-        per_agent_done = ~new_active
-        done_vec = jnp.where(per_agent_done, True, done_all)
-
-        next_state = State(
+        state = EnvState(
+            step=jnp.array(0, dtype=jnp.int32),
             p_pos=p_pos,
             p_vel=p_vel,
-            done=done_vec,
-            step=state.step + 1,
-            active=new_active,
-            battery=new_battery,
+            battery=battery,
+            active=active,
+            rng_key=rng_key,
+        )
+        obs = self._compute_obs_tensor(state)
+        return obs, state
+
+    def _step_impl(self, state: EnvState, actions: jnp.ndarray):
+        """
+        actions: [N, 3]
+            0: force_x
+            1: force_y
+            2: fire (binary)
+        """
+        cfg = self.cfg
+        N = self.N
+
+        # ---------- Physics ----------
+        p_force = actions[:, :2]  # clamp later if needed
+        fire_cmd = (actions[:, 2] > 0.5) & state.active
+
+        # Update velocity (semi-implicit)
+        vel = state.p_vel
+        mass = cfg.mass[:, None]
+        move_mask = _broadcast_mask(cfg.moveable.astype(jnp.float32))
+        vel_new = vel * (1.0 - cfg.damping) + (p_force / jnp.maximum(mass, 1e-6)) * cfg.dt * move_mask
+        vel_new = _apply_max_speed(vel_new, cfg.max_speed)
+
+        pos_new = state.p_pos + vel_new * cfg.dt * move_mask
+
+        # ---------- Battery ----------
+        battery_use = cfg.battery_decay_per_step + cfg.fire_battery_cost * fire_cmd.astype(jnp.float32)
+        battery_new = jnp.maximum(state.battery - battery_use, 0.0)
+
+        battery_empty = battery_new <= 0.0
+        died_battery = battery_empty & cfg.battery_kill_on_zero
+
+        # ---------- Distances ----------
+        diff = pos_new[:, None, :] - pos_new[None, :, :]               # [N,N,2]
+        dist_sq = jnp.sum(diff**2, axis=-1)                             # [N,N]
+        jnp.fill_diagonal(dist_sq, 1e9)  # avoid self
+        vision_sq = cfg.vision_radius ** 2
+        in_vision = _vision_mask(dist_sq, vision_sq)
+
+        # ---------- Tag / Collision ----------
+        tag_sq = cfg.tag_radius ** 2
+        tag_hits = in_vision & (dist_sq <= tag_sq)
+        # shooters/victims separation by team
+        tag_enemy = tag_hits & self.diff_team
+
+        # Friendly tag penalty (same team only, upper-tri to split cost)
+        friend_tag_pairs = tag_hits & self.same_team
+        friend_tag_pen = _upper_tri_sum(friend_tag_pairs.astype(jnp.float32)) * cfg.r_friend_tag_penalty
+
+        # Collision penalty (use radii)
+        radii_sum = cfg.radius[:, None] + cfg.radius[None, :]
+        collide = in_vision & (dist_sq <= (radii_sum ** 2)) & (dist_sq > 0)
+        coll_pen = _upper_tri_sum(collide.astype(jnp.float32)) * cfg.r_collision_penalty
+
+        # ---------- Fire / AoE ----------
+        fire_sq = cfg.fire_radius ** 2
+        fire_mask = fire_cmd[:, None] & in_vision & (dist_sq <= fire_sq)
+        # victim wise: count shooters
+        shooters_per_victim = jnp.sum(fire_mask.astype(jnp.int32), axis=0)
+        killed_by_fire = shooters_per_victim >= cfg.min_shooters_to_kill
+        # Only active enemies can be killed
+        killed_by_fire = killed_by_fire & state.active & self.diff_team.any(axis=0)  # ensure cross-team
+        # Per shooter reward = number of victims they contributed to that actually died (>= threshold)
+        victims_mask = jnp.where(killed_by_fire[None, :], 1.0, 0.0)
+        coordinated_fire = fire_mask.astype(jnp.float32) * victims_mask
+        kill_counts = jnp.sum(coordinated_fire, axis=1)  # per shooter
+
+        # ---------- Update active status ----------
+        newly_dead = died_battery | killed_by_fire
+        active_new = state.active & (~newly_dead)
+
+        # ---------- Rewards ----------
+        # Tag enemy reward: count enemy hits (upper-tri avoided? We give credit per tagger)
+        tag_hit_enemy_counts = jnp.sum(tag_enemy.astype(jnp.float32), axis=1)
+
+        spread_reward = self._compute_spread_reward(pos_new, active_new)
+
+        reward = (
+            tag_hit_enemy_counts * cfg.r_tag_enemy
+            + kill_counts * cfg.r_tag_enemy
+            + friend_tag_pen
+            + coll_pen
+            + spread_reward
         )
 
-        rewards_vec = self._rewards_vec(next_state, coll_mat, tag_hits_enemy, aoe_hits)
+        # Mask rewards of inactive agents
+        reward = reward * active_new.astype(jnp.float32)
 
-        obs = self.get_obs(next_state)
-        dones = {a: done_vec[i] for i, a in enumerate(self.agents)}
-        dones["__all__"] = done_all
-        rewards = {a: rewards_vec[i] for i, a in enumerate(self.agents)}
-        return obs, next_state, rewards, dones, {}
+        # ---------- Done logic ----------
+        step_next = state.step + 1
+        team_alive_counts = jnp.array([
+            jnp.sum((self.teams == t) & active_new) for t in range(self.num_teams)
+        ])
+        team_wiped = team_alive_counts == 0
+        done_all = jnp.any(team_wiped) | (step_next >= cfg.max_steps)
 
-    # ------------------------------------------------------------------ #
-    #                            Observations                             #
-    # ------------------------------------------------------------------ #
-    @partial(jax.jit, static_argnums=0)
-    def get_obs(self, state: State) -> Dict[str, chex.Array]:
-        obs = self._obs_tensor(state)
-        return {a: obs[i] for i, a in enumerate(self.agents)}
+        done_vec = jnp.where(active_new, done_all, True)
 
-    def _obs_tensor(self, state: State) -> chex.Array:
-        p_pos_a = state.p_pos[: self.N]
-        p_vel_a = state.p_vel[: self.N]
-        p_pos_l = state.p_pos[self.N:]
+        info: Dict[str, Any] = {
+            "team_alive_counts": team_alive_counts,
+            "fire_kills": killed_by_fire,
+        }
 
-        active_f = state.active[:, None].astype(jnp.float32)
-        p_pos_a = p_pos_a * active_f
-        p_vel_a = p_vel_a * active_f
+        next_state = EnvState(
+            step=step_next,
+            p_pos=pos_new,
+            p_vel=vel_new,
+            battery=battery_new,
+            active=active_new,
+            rng_key=state.rng_key,  # not used yet
+        )
 
-        rel_land = p_pos_l[None, :, :] - p_pos_a[:, None, :]            # [N, L, 2]
-        rel_pos  = p_pos_a[None, :, :] - p_pos_a[:, None, :]            # [N, N, 2]
-        rel_vel  = p_vel_a[None, :, :].repeat(self.N, axis=0)           # [N, N, 2]
+        obs_next = self._compute_obs_tensor(next_state)
 
-        rel_pos_ns = rel_pos[~self.eye_N].reshape(self.N, self.N - 1, 2)
-        rel_vel_ns = rel_vel[~self.eye_N].reshape(self.N, self.N - 1, 2)
+        if self.cfg.debug_asserts:
+            chex.assert_shape(obs_next, (self.N, self.obs_dim))
+            chex.assert_equal_shape([reward, done_vec, active_new])
 
-        if self.vision_sq is not None:
-            lm_mask = jnp.sum(rel_land ** 2, axis=-1) <= self.vision_sq
-            ag_mask = jnp.sum(rel_pos_ns ** 2, axis=-1) <= self.vision_sq
-            rel_land  = rel_land * lm_mask[..., None]
-            rel_pos_ns = rel_pos_ns * ag_mask[..., None]
-            rel_vel_ns = rel_vel_ns * ag_mask[..., None]
+        return obs_next, reward, done_vec, info, next_state
 
-        parts = [
-            p_vel_a,
-            p_pos_a,
-            rel_land.reshape(self.N, self.L * 2),
-            rel_pos_ns.reshape(self.N, (self.N - 1) * 2),
-            rel_vel_ns.reshape(self.N, (self.N - 1) * 2),
-            self.team_feat,
+    # ----------------- Observations -----------------
+
+    def _compute_obs_tensor(self, state: EnvState) -> jnp.ndarray:
+        """
+        Per-agent observation vector.
+        You can customize; here we include:
+          - self pos/vel (4)
+          - others' relative pos/vel (2*(N-1)*2)
+          - battery (1), active (1)
+          - team onehot (T)
+        """
+        N = self.N
+        pos = state.p_pos
+        vel = state.p_vel
+        rel_pos = pos[None, :, :] - pos[:, None, :]          # [N,N,2]
+        rel_vel = vel[None, :, :] - vel[:, None, :]          # [N,N,2]
+
+        mask_others = ~jnp.eye(N, dtype=bool)
+        rel_pos = rel_pos[mask_others].reshape(N, N-1, 2)
+        rel_vel = rel_vel[mask_others].reshape(N, N-1, 2)
+
+        obs_list = [
+            pos,                         # [N,2]
+            vel,                         # [N,2]
+            rel_pos.reshape(N, -1),      # [N, 2*(N-1)]
+            rel_vel.reshape(N, -1),      # [N, 2*(N-1)]
+            state.battery[:, None],      # [N,1]
+            state.active[:, None].astype(jnp.float32),  # [N,1]
+            self.team_onehot.astype(jnp.float32)        # [N,T]
         ]
-        if self.include_battery_in_obs:
-            parts.append(state.battery[:, None])
+        return jnp.concatenate(obs_list, axis=-1)
 
-        return jnp.concatenate(parts, axis=-1)
+    # ----------------- Rewards helpers -----------------
 
-    # ------------------------------------------------------------------ #
-    #                               Reward                                #
-    # ------------------------------------------------------------------ #
-    def _rewards_vec(
-        self,
-        state: State,
-        coll_mat: chex.Array,
-        tag_hits_enemy: chex.Array,
-        aoe_hits: chex.Array,
-    ) -> chex.Array:
-        active_f = state.active.astype(jnp.float32)
+    def _compute_spread_reward(self, pos: jnp.ndarray, active: jnp.ndarray) -> jnp.ndarray:
+        """
+        Encourage team spread: reward agents inversely to local density of *their own* team.
+        (Simplest proxy: negative of number of same-team neighbors within vision radius)
+        """
+        cfg = self.cfg
+        diff = pos[:, None, :] - pos[None, :, :]
+        dist_sq = jnp.sum(diff**2, axis=-1)
+        jnp.fill_diagonal(dist_sq, 1e9)
+        within = dist_sq <= cfg.vision_radius ** 2
+        same = within & self.same_team
+        density = jnp.sum(same.astype(jnp.float32), axis=1)
+        spread = -density * cfg.r_spread  # lower density => less negative (higher reward)
+        return spread * active.astype(jnp.float32)
 
-        # collision penalty
-        act_pair = state.active[:, None] & state.active[None, :]
-        col_pen = self.local_collision_penalty * jnp.sum(coll_mat & act_pair, axis=1).astype(jnp.float32)
+    # ----------------- Dict helpers -----------------
 
-        # spread reward
-        p_pos_a = state.p_pos[: self.N]
-        p_pos_l = state.p_pos[self.N:]
-        al_diff = p_pos_a[:, None, :] - p_pos_l[None, :, :]
-        al_dist_sq = jnp.sum(al_diff ** 2, axis=-1)
-        if self.vision_sq is None:
-            lm_mask = jnp.ones_like(al_dist_sq, dtype=bool)
-        else:
-            lm_mask = al_dist_sq <= self.vision_sq
-        lm_mask = lm_mask & state.active[:, None]
-        if self.sum_over_landmarks:
-            spread_term = self.spread_reward * jnp.sum(lm_mask.astype(jnp.float32), axis=-1)
-        else:
-            spread_term = self.spread_reward * jnp.any(lm_mask, axis=-1).astype(jnp.float32)
+    def _obs_to_dict(self, obs: jnp.ndarray) -> Dict[str, jnp.ndarray]:
+        return {f"agent_{i}": obs[i] for i in range(self.N)}
 
-        # tag term
-        enemy_tags = jnp.sum(tag_hits_enemy, axis=1).astype(jnp.float32) * active_f
-        friend_tags = jnp.sum((coll_mat & ~tag_hits_enemy), axis=1).astype(jnp.float32) * active_f
-        tag_term = self.tag_enemy_reward * enemy_tags + self.tag_friend_penalty * friend_tags
+    def _rew_to_dict(self, rew: jnp.ndarray) -> Dict[str, jnp.ndarray]:
+        return {f"agent_{i}": rew[i] for i in range(self.N)}
 
-        # fire term
-        enemy_pair = (self.team_mask_a[:, None] & self.team_mask_b[None, :]) | \
-                     (self.team_mask_b[:, None] & self.team_mask_a[None, :])
-        fire_enemy = aoe_hits & enemy_pair
-        fire_friend = aoe_hits & ~enemy_pair
-        fire_enemy_counts = jnp.sum(fire_enemy, axis=1).astype(jnp.float32)
-        fire_friend_counts = jnp.sum(fire_friend, axis=1).astype(jnp.float32)
-        fire_term = (self.fire_enemy_reward * fire_enemy_counts +
-                     self.fire_friend_penalty * fire_friend_counts) * active_f
+    def _done_to_dict(self, done: jnp.ndarray) -> Dict[str, jnp.ndarray]:
+        out = {f"agent_{i}": done[i] for i in range(self.N)}
+        out["__all__"] = jnp.all(done)
+        return out
 
-        return spread_term + col_pen + tag_term + fire_term
+    def _dict_to_array(self, d: Dict[str, jnp.ndarray]) -> jnp.ndarray:
+        # assume consistent order
+        return jnp.stack([d[f"agent_{i}"] for i in range(self.N)], axis=0)
 
-    # ------------------------------------------------------------------ #
-    #                               Physics                               #
-    # ------------------------------------------------------------------ #
-    def _world_step(self, key: chex.PRNGKey, state: State, u: chex.Array):
-        """Apply action forces (with noise) and integrate. No env forces."""
-        # noise
-        keys = jax.random.split(key, self.N)
-        noise = jax.vmap(lambda k, s: jax.random.normal(k, (2,)) * s)(keys, self.u_noise)
-        p_force_agents = jnp.where(self.moveable[: self.N, None], u + noise, 0.0)
 
-        # pad for landmarks
-        p_force = jnp.concatenate([p_force_agents, jnp.zeros((self.L, 2))], axis=0)
-
-        # integrate
-        p_pos = state.p_pos + state.p_vel * self.dt
-        p_vel = state.p_vel * (1 - self.damping) + (p_force / self.mass[:, None]) * self.dt * self.moveable[:, None]
-
-        # clamp speed
-        speed = jnp.linalg.norm(p_vel, axis=1)
-        max_s = self.max_speed
-        over = (speed > max_s) & (max_s >= 0)
-        safe_speed = jnp.where(speed == 0, 1.0, speed)
-        p_vel = jnp.where(over[:, None], p_vel / safe_speed[:, None] * max_s[:, None], p_vel)
-
-        return p_pos, p_vel
+def make_env(
+    n_agents: int,
+    team_ids: jnp.ndarray,
+    **kwargs,
+) -> SwarmEnv:
+    cfg = EnvConfig(
+        n_agents=n_agents,
+        team_ids=team_ids.astype(jnp.int32),
+        mass=jnp.ones((n_agents,), dtype=jnp.float32),
+        moveable=jnp.ones((n_agents,), dtype=jnp.int32),
+        radius=jnp.ones((n_agents,), dtype=jnp.float32) * 0.05,
+        max_speed=1.0,
+        damping=0.25,
+        dt=0.1,
+        vision_radius=1.0,
+        tag_radius=0.1,
+        fire_radius=0.3,
+        **kwargs,
+    )
+    return SwarmEnv(cfg)
