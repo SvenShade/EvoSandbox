@@ -1,0 +1,37 @@
+SwarmVSwarmMPE – quick brief
+
+  Agents/Teams: Homogeneous agents split into two swarms (A/B). Single shared policy; team encoded in obs.
+  
+  Observations (homogeneous tensors):
+    Self vel/pos, relative pos/vel of other agents, relative pos of landmarks, team one‑hot, optional battery level.
+    Limited vision: entities beyond vision_radius are zeroed.
+    Tensor API (get_obs_tensor) plus dict wrapper.
+  
+  Actions: [ax, ay, fire_bit]
+    ax, ay ∈ [-1, 1] accelerations (continuous throttle).
+    fire_bit ∈ {0,1} triggers area-of-effect attack if enough battery.
+  
+  Energy system:
+    Each agent starts with battery_capacity.
+    Move cost: move_cost_coef * (|ax| + |ay|) (L1).
+    Fire cost: fixed fire_cost.
+    Battery clipped at ≥0; hitting 0 instantly deactivates the agent.
+  
+  Combat mechanics:
+    Tag: physical collision (radius check). If you collide with an enemy → +reward; with a friend → penalty. Victims deactivate.
+    Fire AoE: if ≥2 agents (any teams) fire and their AoEs cover a target in the same step, the target deactivates. Firers get +/− rewards for enemy/friendly hits.
+  
+  Rewards (per-agent only):
+    final_i = (1 - tag_ratio) * (spread_i + self_collision_pen_i)
+              + tag_ratio * tag_i
+              + fire_i
+    Spread: reward if within vision_radius of landmarks (sum or binary).
+    Self-collision penalty: optional, per collision.
+    Tag & fire rewards as above.
+  
+  Deactivation & termination:
+    Agents deactivate on: being tagged, 2+ fires, or battery ≤ 0.
+    Episode ends when one team is fully inactive or max_steps reached.
+    Per-agent done mirrors inactivity; "__all__" signals episode end.
+  
+  Performance: Fully vectorised, squared distances only, batched obs/reward helpers; JIT-friendly.
