@@ -1,0 +1,43 @@
+- functionality from simple_tag:
+	- homogeneous agents split into two swarms
+	- single shared policy
+	- team encoded in obs
+- limited observability, view_radius
+- all rewards individual, not global
+- high performance: fully vectorised, squared distances only, batched obs/reward helpers
+- position: 3D
+- action: throttle to update heading: pitch, yaw, roll [-1, 1]
+- action: no-fire/fire [-1, 1]
+- battery
+	- agents are given limited energy resources at the beginning of an episode
+	- energy depleted per timestep, proportional to throttle
+	- energy depleted by discrete amount per fire
+	- if battery fully depleted, agent is deactivated
+- fire behaviour:
+	- area of effect: cone extends from agent in direction of heading
+	- cone height and radius set by view_radius and cone_radius
+	- if another agent is within this cone, it loses energy (same amount lost as it is to fire)
+- collision behaviour:
+	- agent-agent: both are deactivated
+- observation:
+	- relative pos and vel
+	- ID (team agent, enemy agent, landmark)
+- rewards:
+	- small reward per timestep if within view_radius of landmark
+	- small reward if fired on enemy this timestep
+	- large reward if fired on enemy AND enemy deactivated
+	- small penalty if fired on friendly
+	- large penalty if fired on friendly AND friendly deactivated
+	- large penalty if deactivated by enemy fire
+	- large penalty if deactivated by collision with friendly
+- episode end conditions:
+	- when all agents of at least one team are wiped out / deactivated
+	- when max timesteps are reached
+- Perlin2D terrain gen
+- landmarks spawn on terrain
+- collision behaviour updated: agent-terrain collision results in agent deactivation
+- rendering with PyVista
+
+
+Curriculum:
+- cones start as aoe, and become sharper over time
