@@ -81,7 +81,7 @@ def _fractal2d(
     return total / norm
 
 class Perlin2D:
-    """Generate a fractal (1/f) Perlin heightmap and sample heights as requested.
+    """Generate a fractal (1/f) Perlin heightmap.
     """
     def __init__(
         self,
@@ -100,15 +100,11 @@ class Perlin2D:
         self.h, self.w = shape
 
     @jax.jit
-    def sample_height(self, xy: jnp.ndarray, extent: Tuple[float, float]) -> jnp.ndarray:
-        """Bilinearly sample terrain heights at given world coordinates.
-
-        *extent* is half‑width (world_size, world_size) so that world coords are
-        in [‑extent, +extent].
+    def sample_height(self, xy: jnp.ndarray) -> jnp.ndarray:
+        """Bilinear height lookup at normalised coords, [-1, 1].
         """
-        wx, wy = extent
-        ix = ((xy[:, 0] + wx) / (2 * wx)) * (self.w - 1)
-        iy = ((xy[:, 1] + wy) / (2 * wy)) * (self.h - 1)
+        ix = ((xy[:, 0] + 1.0) * 0.5) * (self.w - 1)
+        iy = ((xy[:, 1] + 1.0) * 0.5) * (self.h - 1)
 
         x0 = jnp.clip(jnp.floor(ix).astype(jnp.int32), 0, self.w - 1)
         y0 = jnp.clip(jnp.floor(iy).astype(jnp.int32), 0, self.h - 1)
