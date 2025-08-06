@@ -1,46 +1,52 @@
-import math
-from typing import Tuple
+"""Pure‑JAX Perlin‑noise helper (square‑map, minimal).
 
+* Builds a **fractal** height‑map once during construction.
+* Map is square: size × size, values scaled to **[0, 1]**.
+* Only public call: `sample_height(xy)` for bilinear lookup at normalised
+  coordinates **[0,1]²** (top‑left origin).
+"""
+
+from __future__ import annotations
+
+import math
 import jax
 import jax.numpy as jnp
 
 __all__ = ["Perlin2D"]
-
 F32 = jnp.float32
 
+# --------------------------------------------------------
+#  Fade (smoothstep⁵) ------------------------------------
+# --------------------------------------------------------
+
 @jax.jit
-def _fade(t: jnp.ndarray) -> jnp.ndarray:
+def _fade(t):
     return t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
 
-@jax.jit
-def _random_grads(key: jax.Array, ry: int, rx: int) -> jnp.ndarray:
-    ang = jax.random.uniform(key, (ry + 1, rx + 1), minval=0.0, maxval=2 * math.pi)
-    return jnp.stack([jnp.cos(ang), jnp.sin(ang)], axis=-1)  # (...,2)
+# --------------------------------------------------------
+#  Single‑octave Perlin for square map -------------------
+# --------------------------------------------------------
 
-@jax.jit
-def _perlin2d(key: jax.Array, shape: Tuple[int, int], res: Tuple[int, int]) -> jnp.ndarray:
-    h, w = shape
-    ry, rx = res
-    dy, dx = h // ry, w // rx
+@jax.jit(static_argnames=("size", "res"))
+def _perlin2d(key, *, size: int, res: int):
+    """Return one octave of Perlin noise in **[‑1,1]** for a *size×size* grid."""
+    cell = size // res  # pixels per lattice cell
+    ang = jax.random.uniform(key, (res + 1, res + 1)) * (2 * math.pi)
+    g = jnp.stack([jnp.cos(ang), jnp.sin(ang)], -1)  # (res+1,res+1,2)
 
-    g = _random_grads(key, ry, rx)  # (ry+1, rx+1, 2)
-
-    # grid coords
-    y, x = jnp.mgrid[:h, :w]
-    y = y / dy
-    x = x / dx
+    y, x = jnp.mgrid[:size, :size]
+    y = y / cell
+    x = x / cell
     yi = jnp.floor(y).astype(jnp.int32)
     xi = jnp.floor(x).astype(jnp.int32)
     yf = y - yi
     xf = x - xi
 
-    # gather corner gradients
     g00 = g[yi, xi]
     g10 = g[yi, xi + 1]
     g01 = g[yi + 1, xi]
     g11 = g[yi + 1, xi + 1]
 
-    # dot products
     def dot(gv, dx, dy):
         return jnp.sum(gv * jnp.stack([dx, dy], -1), -1)
 
@@ -49,67 +55,69 @@ def _perlin2d(key: jax.Array, shape: Tuple[int, int], res: Tuple[int, int]) -> j
     n01 = dot(g01, xf, yf - 1)
     n11 = dot(g11, xf - 1, yf - 1)
 
-    # interpolation
     u = _fade(xf)
     v = _fade(yf)
     nx0 = n00 * (1 - u) + n10 * u
     nx1 = n01 * (1 - u) + n11 * u
     nxy = nx0 * (1 - v) + nx1 * v
+    return nxy * jnp.sqrt(2.0)
 
-    return nxy * jnp.sqrt(2.0)  # [-1,1]
+# --------------------------------------------------------
+#  Fractal sum -------------------------------------------
+# --------------------------------------------------------
 
-
-def _fractal2d(
-    key: jax.Array,
-    shape: Tuple[int, int],
-    res: Tuple[int, int],
-    octaves: int,
-    persistence: float,
-    lacunarity: float,
-) -> jnp.ndarray:
-    total = jnp.zeros(shape, F32)
+@jax.jit(static_argnames=("size", "res", "octaves", "persistence", "lacunarity"))
+def _fractal2d(key, *, size: int, res: int, octaves: int, persistence: float, lacunarity: float):
+    total = jnp.zeros((size, size), F32)
     amp = 1.0
-    fy, fx = 1, 1
+    freq = 1
     k = key
     for _ in range(octaves):
         k, subk = jax.random.split(k)
-        total += amp * _perlin2d(subk, shape, (int(res[0] * fy), int(res[1] * fx)))
+        total += amp * _perlin2d(subk, size=size, res=int(res * freq))
         amp *= persistence
-        fy *= lacunarity
-        fx *= lacunarity
-    norm = jnp.sum(jnp.array([persistence ** i for i in range(octaves)], dtype=F32))
+        freq *= lacunarity
+    norm = jnp.sum(jnp.array([persistence ** i for i in range(octaves)], F32))
     return total / norm
 
+# --------------------------------------------------------
+#  Public wrapper ----------------------------------------
+# --------------------------------------------------------
+
 class Perlin2D:
-    """Generate a fractal (1/f) Perlin heightmap.
-    """
+    """Square fractal height‑map (values ∈ [0,1])."""
+
     def __init__(
         self,
-        shape: Tuple[int, int],
-        res: Tuple[int, int],
+        size: int,
+        res: int,
         *,
         octaves: int = 4,
         persistence: float = 0.5,
         lacunarity: float = 2.0,
         key: jax.Array | None = None,
     ) -> None:
-        if shape[0] % res[0] or shape[1] % res[1]:
-            raise ValueError("`shape` must be divisible by `res`.")
+        if size % res:
+            raise ValueError("`size` must be divisible by `res`.")
         key = key or jax.random.PRNGKey(0)
-        self.heightmap = _fractal2d(key, shape, res, octaves, persistence, lacunarity)
-        self.h, self.w = shape
+        raw = _fractal2d(key, size=size, res=res, octaves=octaves, persistence=persistence, lacunarity=lacunarity)
+        self.heightmap = (raw + 1.0) * 0.5  # shift to [0,1]
+        self.size = size
+
+    # ----------------------------------------------
+    #  Bilinear sampler
+    # ----------------------------------------------
 
     @jax.jit
-    def sample_height(self, xy: jnp.ndarray) -> jnp.ndarray:
-        """Bilinear height lookup at normalised coords, [-1, 1].
-        """
-        ix = ((xy[:, 0] + 1.0) * 0.5) * (self.w - 1)
-        iy = ((xy[:, 1] + 1.0) * 0.5) * (self.h - 1)
+    def sample_height(self, xy):
+        """Return height at normalised coords **[0,1]²** (shape (N,2))."""
+        ix = xy[:, 0] * (self.size - 1)
+        iy = xy[:, 1] * (self.size - 1)
 
-        x0 = jnp.clip(jnp.floor(ix).astype(jnp.int32), 0, self.w - 1)
-        y0 = jnp.clip(jnp.floor(iy).astype(jnp.int32), 0, self.h - 1)
-        x1 = jnp.clip(x0 + 1, 0, self.w - 1)
-        y1 = jnp.clip(y0 + 1, 0, self.h - 1)
+        x0 = jnp.floor(ix).astype(jnp.int32)
+        y0 = jnp.floor(iy).astype(jnp.int32)
+        x1 = jnp.clip(x0 + 1, 0, self.size - 1)
+        y1 = jnp.clip(y0 + 1, 0, self.size - 1)
 
         sx = ix - x0.astype(F32)
         sy = iy - y0.astype(F32)
