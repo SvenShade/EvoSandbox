@@ -49,3 +49,28 @@
         if show:
             plt.show()
         return fig
+
+
+
+
+def wall_from_col(col_idx):
+    # stack boundary column with same X/Y but Z at floor
+    Xw = np.vstack([X[:, col_idx], X[:, col_idx]])
+    Yw = np.vstack([Y[:, col_idx], Y[:, col_idx]])
+    Zw = np.vstack([Z[:, col_idx], np.full_like(Z[:, col_idx], zfloor)])
+    ax.plot_surface(Xw, Yw, Zw, color='lightgrey', linewidth=0, antialiased=False)
+
+def wall_from_row(row_idx):
+    Xw = np.vstack([X[row_idx, :], X[row_idx, :]])
+    Yw = np.vstack([Y[row_idx, :], Y[row_idx, :]])
+    Zw = np.vstack([Z[row_idx, :], np.full_like(Z[row_idx, :], zfloor)])
+    ax.plot_surface(Xw, Yw, Zw, color='lightgrey', linewidth=0, antialiased=False)
+
+# Four side walls
+wall_from_col(0)         # left
+wall_from_col(-1)        # right
+wall_from_row(0)         # front
+wall_from_row(-1)        # back
+
+# Optional bottom (the floor rectangle)
+ax.plot_surface(X, Y, np.full_like(Z, zfloor), color='gainsboro', linewidth=0)
