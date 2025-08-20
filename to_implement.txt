@@ -59,3 +59,7 @@ print("Depth peeling available?", ok)    # should be True on EGL
 # sanity: make sure GL has alpha bits and MSAA is 0
 rw = p.render_window
 print("alpha bits:", rw.GetAlphaBitPlanes(), "MSAA:", rw.GetMultiSamples())
+
+glyphs = landmarks.glyph(geom=sphere, orient=False, scale=False)
+glyphs_clipped = glyphs.clip_box(bounds=(0,1,0,1,0,1))  # keep inside the unit cube
+plotter.add_mesh(glyphs_clipped)
