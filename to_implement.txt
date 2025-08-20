@@ -41,3 +41,21 @@
 
 Curriculum:
 - cones start as aoe, and become sharper over time
+
+
+export VTK_DEFAULT_OPENGL_WINDOW=vtkEGLRenderWindow
+export VTK_FORCE_MSAA=0
+
+import os
+os.environ["PYVISTA_OFF_SCREEN"] = "1"
+
+import pyvista as pv
+p = pv.Plotter(off_screen=True)
+
+pv.global_theme.multi_samples = 0        # belt-and-braces: no MSAA
+ok = p.enable_depth_peeling(number_of_peels=8, occlusion_ratio=0.0)
+print("Depth peeling available?", ok)    # should be True on EGL
+
+# sanity: make sure GL has alpha bits and MSAA is 0
+rw = p.render_window
+print("alpha bits:", rw.GetAlphaBitPlanes(), "MSAA:", rw.GetMultiSamples())
