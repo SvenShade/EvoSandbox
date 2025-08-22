@@ -63,3 +63,19 @@ print("alpha bits:", rw.GetAlphaBitPlanes(), "MSAA:", rw.GetMultiSamples())
 glyphs = landmarks.glyph(geom=sphere, orient=False, scale=False)
 glyphs_clipped = glyphs.clip_box(bounds=(0,1,0,1,0,1))  # keep inside the unit cube
 plotter.add_mesh(glyphs_clipped)
+
+if len(hist) >= 2:
+	for (t0, p0), (t1, p1) in zip(hist[:-1], hist[1:]):
+		# opacity based on the newer end of the segment
+		age = max(0.0, sim_time - t1)
+		w = 1.0 - min(1.0, age / max(T, 1e-9))
+		opacity = max(0.02, w ** fade_gamma)
+
+		line = pv.Line(np.asarray(p0, float), np.asarray(p1, float))
+		tube = line.tube(radius=trail_radius, n_sides=12, capping=True)
+		plotter.add_mesh(
+			tube,
+			color=color,
+			opacity=float(opacity),
+			smooth_shading=True,
+		)
