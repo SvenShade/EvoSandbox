@@ -74,3 +74,7 @@ wall_from_row(-1)        # back
 
 # Optional bottom (the floor rectangle)
 ax.plot_surface(X, Y, np.full_like(Z, zfloor), color='gainsboro', linewidth=0)
+
+
+import subprocess; subprocess.run(["ffmpeg","-y","-i","input.avi","-c:v","libx264","-crf","23","-preset","veryfast","-pix_fmt","yuv420p","-movflags","+faststart","-an","output.mp4"], check=True)
+
