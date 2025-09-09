@@ -79,56 +79,52 @@ ax.plot_surface(X, Y, np.full_like(Z, zfloor), color='gainsboro', linewidth=0)
 import subprocess; subprocess.run(["ffmpeg","-y","-i","input.avi","-c:v","libx264","-crf","23","-preset","veryfast","-pix_fmt","yuv420p","-movflags","+faststart","-an","output.mp4"], check=True)
 
 
-@jax.jit
-def level_heightmap_square(
+@jax.jit(static_argnames=("radius",))
+def level_heightmap_square_intpoints(
     heightmap: chex.Array,      # shape (H, H)
-    points: chex.Array,         # shape (N, 2), (x, y) pixel coords, N >= 2
-    radius: Union[float, int],  # scalar radius
+    points: chex.Array,         # shape (N, 2), int pixel coords (x, y), N >= 2
+    radius: Union[int, float],  # scalar; SxS box fits comfortably inside the map
 ) -> chex.Array:
     """
-    For each point, set all pixels inside the circle (centered at that point,
-    with the given radius) to the height at the point’s indexed (rounded, clipped) pixel.
-    Later points win in overlaps.
+    For each integer (x, y) point, set every pixel within the circle of `radius`
+    to the height at (y, x). Later points overwrite earlier ones.
 
-    Assumptions:
+    Assumptions (no bounds checks):
       - heightmap is square (H x H)
-      - points has shape (N, 2) with N >= 2
+      - points are integer indices (x, y)
+      - each point has at least `ceil(radius)` pixels of margin to every edge
     """
     hm = jnp.asarray(heightmap)
     H = hm.shape[-1]
-    # Quick shape check (works under JIT because shapes are static)
-    if hm.shape[-2] != H:
-        raise ValueError("heightmap must be square (H x H).")
+    assert hm.shape[-2] == H, "heightmap must be square (H x H)."
+    assert points.ndim == 2 and points.shape[-1] == 2 and points.shape[0] >= 2
 
-    pts = jnp.asarray(points, dtype=hm.dtype)
-    if pts.ndim != 2 or pts.shape[-1] != 2:
-        raise ValueError("`points` must have shape (N, 2) with N >= 2.")
+    pts = jnp.asarray(points).astype(jnp.int32)
 
+    # Fixed box size S = 2*ceil(radius)+1 (static for JIT)
+    rad_px = int(math.ceil(float(radius)))
+    S = 2 * rad_px + 1
+
+    # Precompute a constant (S x S) disk mask centered at (0,0)
     r = jnp.asarray(radius, dtype=hm.dtype)
-    r2 = r * r
+    offs = jnp.arange(-rad_px, rad_px + 1, dtype=hm.dtype)
+    dy = offs.reshape(S, 1)
+    dx = offs.reshape(1, S)
+    mask = (dx * dx + dy * dy) <= (r * r)          # bool, shape (S, S)
 
     def body(i, cur_hm):
-        cx, cy = pts[i, 0], pts[i, 1]
+        px = pts[i, 0]   # x
+        py = pts[i, 1]   # y
 
-        # Target height from this point's (rounded, clipped) pixel
-        ix = jnp.clip(jnp.round(cx).astype(jnp.int32), 0, H - 1)
-        iy = jnp.clip(jnp.round(cy).astype(jnp.int32), 0, H - 1)
-        h_target = cur_hm[iy, ix].astype(cur_hm.dtype)
+        # Target height at the center pixel
+        h_target = cur_hm[py, px].astype(cur_hm.dtype)
 
-        # Bounded box around the circle (exclusive ends for slicing)
-        x0 = jnp.maximum(0, jnp.floor(cx - r).astype(jnp.int32))
-        y0 = jnp.maximum(0, jnp.floor(cy - r).astype(jnp.int32))
-        x1 = jnp.minimum(H, jnp.ceil(cx + r).astype(jnp.int32) + 1)
-        y1 = jnp.minimum(H, jnp.ceil(cy + r).astype(jnp.int32) + 1)
+        # Top-left of the SxS box centered on (px, py)
+        x0 = px - rad_px
+        y0 = py - rad_px
 
-        sub = lax.dynamic_slice(cur_hm, (y0, x0), (y1 - y0, x1 - x0))
-
-        # Local distance mask inside the box
-        yy = jnp.arange(y0, y1, dtype=hm.dtype).reshape(-1, 1)
-        xx = jnp.arange(x0, x1, dtype=hm.dtype).reshape(1, -1)
-        dist2 = (yy - cy) ** 2 + (xx - cx) ** 2
-        mask = dist2 <= r2
-
+        # Slice (S, S), apply mask, and write back
+        sub = lax.dynamic_slice(cur_hm, (y0, x0), (S, S))
         new_sub = jnp.where(mask, h_target, sub)
         return lax.dynamic_update_slice(cur_hm, new_sub, (y0, x0))
 
