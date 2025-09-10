@@ -123,3 +123,13 @@ def aerials(
 
     snapshots = jnp.where(inside, vals, -1.0)
     return snapshots
+
+grid.point_data["mask"] = mask.astype(np.uint8).ravel(order="F")
+
+# quick view (two colors), no scalar bar
+grid.plot(
+    scalars="mask",
+    cmap=["#cccccc", "#ff6f61"],   # [False color, True color]
+    show_scalar_bar=False,
+    lighting=True,
+)
