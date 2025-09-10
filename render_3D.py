@@ -79,53 +79,47 @@ ax.plot_surface(X, Y, np.full_like(Z, zfloor), color='gainsboro', linewidth=0)
 import subprocess; subprocess.run(["ffmpeg","-y","-i","input.avi","-c:v","libx264","-crf","23","-preset","veryfast","-pix_fmt","yuv420p","-movflags","+faststart","-an","output.mp4"], check=True)
 
 
-@jax.jit(static_argnames=("radius",))
-def level_heightmap_square_intpoints(
-    heightmap: chex.Array,      # shape (H, H)
-    points: chex.Array,         # shape (N, 2), int pixel coords (x, y), N >= 2
-    radius: Union[int, float],  # scalar; SxS box fits comfortably inside the map
-) -> chex.Array:
-    """
-    For each integer (x, y) point, set every pixel within the circle of `radius`
-    to the height at (y, x). Later points overwrite earlier ones.
+def _nearest_sample(img, y, x):
+    H, W = img.shape
+    yi = jnp.clip(jnp.round(y).astype(jnp.int32), 0, H - 1)
+    xi = jnp.clip(jnp.round(x).astype(jnp.int32), 0, W - 1)
+    return img[yi, xi]
 
-    Assumptions (no bounds checks):
-      - heightmap is square (H x H)
-      - points are integer indices (x, y)
-      - each point has at least `ceil(radius)` pixels of margin to every edge
-    """
-    hm = jnp.asarray(heightmap)
-    H = hm.shape[-1]
-    assert hm.shape[-2] == H, "heightmap must be square (H x H)."
-    assert points.ndim == 2 and points.shape[-1] == 2 and points.shape[0] >= 2
+def aerials(
+    heightmap: jnp.ndarray,      # [S, S] float
+    terrain_mask: jnp.ndarray,   # [S, S] bool
+    pos: jnp.ndarray,            # [N, 3] (x, y, z)
+    *,
+    view_radius: float,          # spherical radius
+    distance_scale: float = 50.0
+):
+    N = pos.shape[0]
+    half = (2 * ceil(view_radius) + 1) // 2
 
-    pts = jnp.asarray(points).astype(jnp.int32)
+    offs = jnp.arange(-half, half + 1, dtype=jnp.float32)
+    dy = offs[None, :, None]                      # [1, S, 1]
+    dx = offs[None, None, :]                      # [1, 1, S]
 
-    # Fixed box size S = 2*ceil(radius)+1 (static for JIT)
-    rad_px = int(math.ceil(float(radius)))
-    S = 2 * rad_px + 1
+    x = pos[:, 0][:, None, None]
+    y = pos[:, 1][:, None, None]
+    z = pos[:, 2][:, None, None]
 
-    # Precompute a constant (S x S) disk mask centered at (0,0)
-    r = jnp.asarray(radius, dtype=hm.dtype)
-    offs = jnp.arange(-rad_px, rad_px + 1, dtype=hm.dtype)
-    dy = offs.reshape(S, 1)
-    dx = offs.reshape(1, S)
-    mask = (dx * dx + dy * dy) <= (r * r)          # bool, shape (S, S)
+    X = x + dx
+    Y = y + dy
 
-    def body(i, cur_hm):
-        px = pts[i, 0]   # x
-        py = pts[i, 1]   # y
+    # Nearest-neighbor for both height and mask (mask is boolean -> float)
+    H_patch = _nearest_sample(heightmap, Y, X)    # [N, S, S]
+    M_patch = _nearest_sample(terrain_mask, Y, X).astype(jnp.float32)
 
-        # Target height at the center pixel
-        h_target = cur_hm[py, px].astype(cur_hm.dtype)
+    # Clearance and encoding
+    clearance = jnp.maximum(z - H_patch, 0.0)
+    mag = jnp.clip(clearance / distance_scale, 0.0, 1.0)
+    sign = jnp.where(M_patch > 0.5, 1.0, -1.0)
+    vals = sign * mag                               # [-1,1], 0 at contact
 
-        # Top-left of the SxS box centered on (px, py)
-        x0 = px - rad_px
-        y0 = py - rad_px
+    # Spherical visibility
+    dist3 = jnp.sqrt(dx**2 + dy**2 + clearance**2)
+    inside = dist3 <= view_radius
 
-        # Slice (S, S), apply mask, and write back
-        sub = lax.dynamic_slice(cur_hm, (y0, x0), (S, S))
-        new_sub = jnp.where(mask, h_target, sub)
-        return lax.dynamic_update_slice(cur_hm, new_sub, (y0, x0))
-
-    return lax.fori_loop(0, pts.shape[0], body, hm)
+    snapshots = jnp.where(inside, vals, -1.0)
+    return snapshots
