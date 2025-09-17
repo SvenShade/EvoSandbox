@@ -133,3 +133,16 @@ grid.plot(
     show_scalar_bar=False,
     lighting=True,
 )
+
+
+def rear_facing_mask(pos, vel, max_dist, cos_thresh=0.8660254037844386):
+    # pos, vel: (N,3).  cos_thresh = cos(half_angle); 0.866... ≈ cos(30°)
+    eps = 1e-8
+    vhat = vel / (jnp.linalg.norm(vel, axis=-1, keepdims=True) + eps)         # (N,1,3) later
+    r = pos[None, :, :] - pos[:, None, :]                                      # r_ij: i -> j
+    d = jnp.linalg.norm(r, axis=-1) + eps
+    u = r / d[..., None]                                                       # unit i->j
+    a = jnp.einsum('ik,ijk->ij', vhat, u)                                      # i faces j
+    b = jnp.einsum('jk,ijk->ij', vhat, u)                                      # j faces away from i (rear of j)
+    within = (d <= max_dist) & (~jnp.eye(pos.shape[0], dtype=bool))
+    return within & (a >= cos_thresh) & (b >= cos_thresh)
