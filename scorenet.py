@@ -33,44 +33,42 @@ class AntisymMatcher(nn.Module):
         self.head_scale = 1.0 / math.sqrt(rank)
 
     def forward(self, feats: torch.Tensor) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        feats : Tensor, shape [B, N+1, C] or [B, N, C]
+            Decoder token features; if a CLS token is present at index 0, it is dropped.
+        Returns
+        -------
+        logits : Tensor, shape [B, N, N]
+            Antisymmetric pairwise logits suitable for log_optimal_transport.
+        """
+        if feats.dim() != 3:
+            raise ValueError(f"AntisymMatcher expects [B, N, C] or [B, N+1, C], got {feats.shape}")
+        # Drop CLS token (mirror original ScoreNet behavior exactly)
         feats = feats[:, 1:]
         B, L, C = feats.shape
         # Fold every two tokens into one vertex feature (same assumption as ScoreNet)
-        feats = feats.view(B, L // 2, 2, C).mean(dim=2) # [B, N, C], N = L//2
+        feats = feats.view(B, L // 2, 2, C).mean(dim=2)  # [B, N, C], N = L//2
         N = feats.size(1)
-        # Lightweight normalization that adapts to C
-        x = F.layer_norm(feats, (C,)))
+        x = F.layer_norm(feats, (C,)))(feats, (C,)))
         x = self.do(x)
-            
-        # If decoder produced more vertices than target_N, keep first target_N
-        if N > target_N:
-            x = x[:, :target_N, :]
-            N = target_N
-        
-        
+
         # Projections for multi-head low-rank bilinear scoring
         Q = self.q_proj(x).view(B, N, self.heads, self.rank)
         K = self.k_proj(x).view(B, N, self.heads, self.rank)
-        
-        
+
         # Per-head bilinear scores, then sum heads → [B, N, N]
         # A_h(i,j) = <Q[i,h,:], K[j,h,:]>
         A = torch.einsum('b n h r, b m h r -> b h n m', Q, K)
         A = A * self.head_scale
-        A = A.sum(dim=1) # sum over heads → [B, N, N]
-        
-        
+        A = A.sum(dim=1)  # sum over heads → [B, N, N]
+
         # Enforce antisymmetry; suppress diagonal (no self loops)
         S = 0.5 * (A - A.transpose(1, 2))
-        # If fewer than max vertices, pad logits to [N_cfg,N_cfg] with very negative values
-        if N < self.n_vertices:
-        pad = self.n_vertices - N
-        S = F.pad(S, (0, pad, 0, pad), value=-1e4)
-        N = self.n_vertices
         diag_mask = torch.eye(N, device=S.device, dtype=torch.bool).unsqueeze(0)
         S = S.masked_fill(diag_mask, float('-inf'))
-        
-        
+
         # Optional temperature
         S = S * self.logit_scale.clamp_min(1e-2)
         return S
