@@ -8,70 +8,47 @@ class AntisymMatcher(nn.Module):
     """
     Multi-head antisymmetric matcher for building footprints.
 
-    Computes pairwise successor logits S ∈ R^{B×N×N} from decoder token features
-    using H low-rank bilinear heads, then enforces antisymmetry by construction:
-        S = 0.5 * (A - A^T)
-    where per-head scores are A_h(i,j) = (Q_h f_i)^T (K_h f_j). Heads are summed.
-
-    Designed for buildings (single-ring), so we suppress the diagonal (no self-edges).
-    Padding is still handled by the external OT "dustbin" via bin_score.
+    Identical assumptions to ScoreNet:
+      - drop CLS
+      - fold every 2 tokens → 1 vertex feature by mean
+      - no diagonal suppression; pads handled by OT dustbin
+      - no padding/truncation inside the head
     """
     def __init__(self, n_vertices: int, in_channels: int = 256, rank: int = 16, heads: int = 4, dropout: float = 0.1):
         super().__init__()
         self.n_vertices = n_vertices
         self.in_channels = in_channels
-        self.rank = rank              # per-head rank
-        self.heads = heads            # number of low-rank heads
+        self.rank = rank
+        self.heads = heads
 
-        # Low-rank projections for all heads in one matmul (C -> H*R)
         self.q_proj = nn.Linear(in_channels, rank * heads, bias=False)
         self.k_proj = nn.Linear(in_channels, rank * heads, bias=False)
-
-        # Stabilization
         self.do = nn.Dropout(dropout)
         self.logit_scale = nn.Parameter(torch.tensor(1.0))
         self.head_scale = 1.0 / math.sqrt(rank)
 
     def forward(self, feats: torch.Tensor) -> torch.Tensor:
-        """
-        Parameters
-        ----------
-        feats : Tensor, shape [B, N+1, C] or [B, N, C]
-            Decoder token features; if a CLS token is present at index 0, it is dropped.
-        Returns
-        -------
-        logits : Tensor, shape [B, N, N]
-            Antisymmetric pairwise logits suitable for log_optimal_transport.
-        """
         if feats.dim() != 3:
             raise ValueError(f"AntisymMatcher expects [B, N, C] or [B, N+1, C], got {feats.shape}")
-        # Drop CLS token (mirror original ScoreNet behavior exactly)
+        # Mirror ScoreNet: drop CLS, fold pairs (2 tokens per vertex)
         feats = feats[:, 1:]
         B, L, C = feats.shape
-        # Fold every two tokens into one vertex feature (same assumption as ScoreNet)
-        feats = feats.view(B, L // 2, 2, C).mean(dim=2)  # [B, N, C], N = L//2
+        feats = feats.view(B, L // 2, 2, C).mean(dim=2)   # [B, N, C], N = L//2
         N = feats.size(1)
-        x = F.layer_norm(feats, (C,)))(feats, (C,)))
-        x = self.do(x)
 
-        # Projections for multi-head low-rank bilinear scoring
+        # Lightweight normalization and projections
+        x = F.layer_norm(feats, (C,))
+        x = self.do(x)
         Q = self.q_proj(x).view(B, N, self.heads, self.rank)
         K = self.k_proj(x).view(B, N, self.heads, self.rank)
 
-        # Per-head bilinear scores, then sum heads → [B, N, N]
-        # A_h(i,j) = <Q[i,h,:], K[j,h,:]>
-        A = torch.einsum('b n h r, b m h r -> b h n m', Q, K)
-        A = A * self.head_scale
-        A = A.sum(dim=1)  # sum over heads → [B, N, N]
+        # Multi-head low-rank bilinear scores
+        A = torch.einsum('b n h r, b m h r -> b h n m', Q, K) * self.head_scale
+        A = A.sum(dim=1)  # [B, N, N]
 
-        # Enforce antisymmetry; suppress diagonal (no self loops)
+        # Antisymmetry (no diagonal masking)
         S = 0.5 * (A - A.transpose(1, 2))
-        diag_mask = torch.eye(N, device=S.device, dtype=torch.bool).unsqueeze(0)
-        S = S.masked_fill(diag_mask, float('-inf'))
-
-        # Optional temperature
-        S = S * self.logit_scale.clamp_min(1e-2)
-        return S
+        return S * self.logit_scale.clamp_min(1e-2)
 
 
 # --- Patched EncoderDecoder that swaps in AntisymMatcher ---
