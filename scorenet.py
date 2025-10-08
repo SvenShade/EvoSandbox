@@ -45,17 +45,11 @@ class AntisymMatcher(nn.Module):
         """
         if feats.dim() != 3:
             raise ValueError(f"AntisymMatcher expects [B, N, C] or [B, N+1, C], got {feats.shape}")
-        # Drop CLS if present (mirrors original ScoreNet behavior)
-        if feats.size(1) > self.n_vertices + 1:
-            feats = feats[:, 1:]
+        # Drop CLS token (mirror original ScoreNet behavior exactly)
+        feats = feats[:, 1:]
         B, L, C = feats.shape
-        target_N = self.n_vertices
-
-        # --- Compact 2 tokens per vertex (x/y bins) into a single vertex feature ---
-        # If we have exactly 2*target_N tokens, fold cleanly; otherwise fold any complete pairs.
-        if L >= 2 * target_N:
-            feats = feats[:, : 2 * target_N, :]
-            feats = feats.view(B, target_N, 2, C).mean(dim=2)  # [B, N, C]
+        # Fold every two tokens into one vertex feature (same assumption as ScoreNet)
+        feats = feats.view(B, L // 2, 2, C).mean(dim=2)  # [B, N, C], N = L//2  # [B, N, C]
         elif L % 2 == 0:
             feats = feats.view(B, L // 2, 2, C).mean(dim=2)    # [B, N, C] with N=L/2
         else:
@@ -101,6 +95,25 @@ class AntisymMatcher(nn.Module):
 
 # --- Patched EncoderDecoder that swaps in AntisymMatcher ---
 import math
+class _MatcherShim(nn.Module):
+    """Shim to preserve model.scorenet1/2 calls used in utils.test_generate.
+    scorenet1(feats) -> matcher(feats); scorenet2(feats) -> zeros.
+    """
+    def __init__(self, matcher: nn.Module, n_vertices: int, mode: str):
+        super().__init__()
+        assert mode in {"pass", "zeros"}
+        self.matcher = matcher
+        self.n_vertices = n_vertices
+        self.mode = mode
+    def forward(self, feats: torch.Tensor) -> torch.Tensor:
+        if self.mode == "pass":
+            return self.matcher(feats)
+        # zeros path: produce [B, N_cfg, N_cfg] zeros on the correct device/dtype
+        B = feats.size(0)
+        N = self.n_vertices
+        return feats.new_zeros((B, N, N))
+
+
 class EncoderDecoder(nn.Module):
     def __init__(self, cfg, encoder: nn.Module, decoder: nn.Module):
         super().__init__()
@@ -114,6 +127,10 @@ class EncoderDecoder(nn.Module):
         heads = getattr(cfg, 'MATCHER_HEADS', 4)
         rank = getattr(cfg, 'MATCHER_RANK', 16)
         self.matcher = AntisymMatcher(getattr(cfg, 'N_VERTICES', 200), in_channels=in_ch, rank=rank, heads=heads)
+
+        # Back-compat: expose scorenet1/2 so utils.test_generate still works
+        self.scorenet1 = _MatcherShim(self.matcher, n_vertices=self.cfg.N_VERTICES, mode="pass")
+        self.scorenet2 = _MatcherShim(self.matcher, n_vertices=self.cfg.N_VERTICES, mode="zeros")
 
         # Preserve the same learnable bin score parameter that original code used
         bin_score = torch.nn.Parameter(torch.tensor(1.))
