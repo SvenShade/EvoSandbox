@@ -148,3 +148,34 @@ class EncoderDecoder(nn.Module):
         encoder_out = self.encoder(image)
         preds, feats = self.decoder.predict(encoder_out, tgt)
         return preds, feats
+
+
+
+# Utils patch:
+
+        # Build permutation scores directly from the matcher (no scorenet1/2)
+        if isinstance(model, torch.nn.parallel.DistributedDataParallel):
+            matcher = model.module.matcher
+        else:
+            matcher = model.matcher
+
+        # Ensure the matcher folds to exactly N=CFG.N_VERTICES vertices:
+        # keep CLS + 2*N tokens from feats (matcher drops CLS and folds pairs).
+        N = CFG.N_VERTICES
+        feats_trim = feats[:, : (2 * N + 1), :]
+
+        # Build per-vertex (y,x) coordinates from the generated token sequence.
+        # Drop BOS, take first 2*N tokens, split into (y,x), normalise by NUM_BINS-1.
+        seq = batch_preds[:, 1:]                       # drop BOS
+        seq = seq[:, : 2 * N]                          # keep exactly 2N tokens
+        y_ids = seq[:, 0::2].float()
+        x_ids = seq[:, 1::2].float()
+        denom = max(1, int(getattr(CFG, "NUM_BINS", getattr(CFG, "INPUT_HEIGHT", 224)) - 1))
+        xy = torch.stack([y_ids / denom, x_ids / denom], dim=-1)   # [B, N, 2] in [0,1]
+
+        # Matcher returns antisymmetric pairwise logits [B, N, N]
+        perm_logits = matcher(feats_trim, xy=xy)
+
+        # Turn scores into a hard permutation with Hungarian
+        perm_preds = scores_to_permutations(perm_logits)
+
