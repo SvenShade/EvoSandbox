@@ -1,181 +1,105 @@
+import math
 import torch
 from torch import nn
 from torch.nn import functional as F
-import math
 
-# --- New head: Antisymmetric matcher (drop-in replacement for two ScoreNet heads) ---
-class AntisymMatcher(nn.Module):
-    """
-    Elegant, coordinate-aware antisymmetric matcher for building footprints.
+# -----------------------------------------------------------------------------
+# ScoreNet (Minimal, Efficient Drop-in)
+# -----------------------------------------------------------------------------
+# API & assumptions preserved:
+#   • Input feats: [B, N(+1), C] from decoder (with CLS/BOS at index 0)
+#   • Behavior: drop CLS, fold (y,x) token pairs → vertices [B, N, C]
+#   • Output: raw unconstrained scores [B, N, N] (no antisymmetry, no diag mask)
+#
+# Implementation:
+#   Replace the N×N 1×1-conv stack with a low-rank, multi-head bilinear form
+#   computed via GEMMs (einsum). Add a small per-vertex diagonal bias so pads
+#   can self-loop strongly.
+# -----------------------------------------------------------------------------
 
-    Core ideas (simple + strong):
-      - Drop CLS, fold (y,x) token pairs → one vertex feature per step (ScoreNet assumption)
-      - Fuse vertex coords into token features (feature + coord embedding)
-      - Multi-head low-rank bilinear scoring + antisymmetry by construction
-      - Spatial kNN mask + distance bias to prefer local, plausible edges
-      - Learnable diagonal bias so pads self-connect confidently
-    """
-    def __init__(
-        self,
-        n_vertices: int,
-        in_channels: int = 256,
-        rank: int = 32,
-        heads: int = 6,
-        topk_k: int = 12,
-        lambda_dist: float = 6.0,
-    ):
+class ScoreNet(nn.Module):
+    def __init__(self, in_channels: int = 256, heads: int = 6, rank: int = 32):
         super().__init__()
-        self.n_vertices = n_vertices
-        self.in_channels = in_channels
-        self.rank = rank
-        self.heads = heads
-        self.topk_k = topk_k
-        self.lambda_dist = lambda_dist
+        self.C, self.H, self.R = in_channels, heads, rank
 
-        # Coordinate fusion: map (y,x) in [0,1]^2 to feature space and add residually
-        self.coord_proj = nn.Linear(2, in_channels, bias=True)
-
-        # Projections for multi-head low-rank bilinear compatibility
-        self.q_proj = nn.Linear(in_channels, rank * heads, bias=False)
-        self.k_proj = nn.Linear(in_channels, rank * heads, bias=False)
-
-        self.logit_scale = nn.Parameter(torch.tensor(1.0))
+        # Per-head low-rank projections
+        self.q_proj = nn.Linear(in_channels, heads * rank, bias=False)
+        self.k_proj = nn.Linear(in_channels, heads * rank, bias=False)
         self.head_scale = 1.0 / math.sqrt(rank)
 
-        # Diagonal bias: one scalar per vertex computed from its (fused) feature
+        # Per-vertex diagonal bias (pads/self-loops)
         self.diag_proj = nn.Linear(in_channels, 1, bias=True)
 
-    def forward(self, feats: torch.Tensor, xy: torch.Tensor) -> torch.Tensor:
-        """feats: [B, N+1, C] or [B, N, C]; xy: [B, N, 2] normalised to [0,1]."""
-        # 1) ScoreNet-like folding (drop CLS, fold two tokens → one vertex feature)
+        # Optional global temperature for logits
+        self.logit_scale = nn.Parameter(torch.tensor(1.0))
+
+    @staticmethod
+    def _fold_vertices(feats: torch.Tensor) -> torch.Tensor:
+        # Drop CLS, fold two tokens (y,x) → one vertex feature by mean
         feats = feats[:, 1:]
         B, L, C = feats.shape
-        feats = feats.view(B, L // 2, 2, C).mean(dim=2)  # [B, N, C]
-        N = feats.size(1)
+        return feats.view(B, L // 2, 2, C).mean(dim=2)  # [B, N, C]
 
-        # 2) Fuse coordinates at the vertex level (residual)
-        # Expect xy already aligned to folded vertices
-        fused = feats + self.coord_proj(xy)
+    def forward(self, feats: torch.Tensor) -> torch.Tensor:
+        """
+        feats: [B, N+1, C] or [B, N, C]  ->  scores S: [B, N, N]
+        """
+        x = self._fold_vertices(feats)                  # [B, N, C]
+        B, N, C = x.shape
 
-        # 3) Multi-head low-rank bilinear scores
-        Q = self.q_proj(fused).view(B, N, self.heads, self.rank)
-        K = self.k_proj(fused).view(B, N, self.heads, self.rank)
-        A = torch.einsum('b n h r, b m h r -> b h n m', Q, K) * self.head_scale
-        A = A.sum(dim=1)  # [B, N, N]
+        # Multi-head low-rank bilinear scores
+        Q = self.q_proj(x).view(B, N, self.H, self.R)   # [B, N, H, R]
+        K = self.k_proj(x).view(B, N, self.H, self.R)   # [B, N, H, R]
+        S = torch.einsum('b n h r, b m h r -> b h n m', Q, K) * self.head_scale  # [B, H, N, N]
+        S = S.sum(dim=1)                                # [B, N, N]
 
-        # 4) Spatial kNN mask + distance bias (encourage local, plausible edges)
-        if self.topk_k is not None and self.topk_k > 0 and self.topk_k < N:
-            dist = torch.cdist(xy, xy, p=2)  # [B, N, N]
-            k = self.topk_k
-            row_idx = dist.topk(k, largest=False, dim=-1).indices
-            col_idx = dist.topk(k, largest=False, dim=-2).indices
-            mask = torch.zeros_like(A, dtype=torch.bool)
-            mask.scatter_(-1, row_idx, True)
-            mask.scatter_(-2, col_idx, True)
-            A = A.masked_fill(~mask, A.new_full((), -10.0))
-            if self.lambda_dist != 0.0:
-                A = A + (-float(self.lambda_dist)) * dist
+        # Diagonal bias for pads
+        S = S + torch.diag_embed(self.diag_proj(x).squeeze(-1))
 
-        # 5) Antisymmetry + per-vertex diagonal bias (pads)
-        S = 0.5 * (A - A.transpose(1, 2))
-        diag_bias = self.diag_proj(fused).squeeze(-1)  # [B, N]
-        S = S + torch.diag_embed(diag_bias)
         return S * self.logit_scale.clamp_min(1e-2)
 
 
-# --- Patched EncoderDecoder that swaps in AntisymMatcher ---
-import math
+# -----------------------------------------------------------------------------
+# EncoderDecoder (Minimal two-head OMN wrapper; optional)
+# -----------------------------------------------------------------------------
+# Mirrors original OMN: two heads combined as P1 + P2ᵀ, then Sinkhorn/OT.
+# Use this wrapper only if you want to swap at the entry module level;
+# otherwise instantiate ScoreNet twice where your original code did.
+# -----------------------------------------------------------------------------
 
 class EncoderDecoder(nn.Module):
+    """
+    Assumes `log_optimal_transport(scores, bin_score, iters)` is defined in scope.
+    - forward(image, tgt)  -> (preds_f, perm_mat)
+    - predict(image, tgt)  -> (preds, feats)
+    """
     def __init__(self, cfg, encoder: nn.Module, decoder: nn.Module):
         super().__init__()
-        self.cfg = cfg
-        self.encoder = encoder
-        self.decoder = decoder
+        self.cfg, self.encoder, self.decoder = cfg, encoder, decoder
+        heads = getattr(cfg, 'SCORENET_HEADS', 6)
+        rank  = getattr(cfg, 'SCORENET_RANK', 32)
+        C     = getattr(cfg, 'IN_CHANNELS', 256)  # or fix to 256 if preferred
 
-        # REPLACEMENT: one antisymmetric matcher instead of two ScoreNet branches
-        # Default in_channels=512 to mirror prior ScoreNet usage; adjust via cfg if needed.
-        in_ch = 256
-        heads = getattr(cfg, 'MATCHER_HEADS', 4)
-        rank = getattr(cfg, 'MATCHER_RANK', 16)
-        self.matcher = AntisymMatcher(getattr(cfg, 'N_VERTICES', 200), in_channels=256, rank=getattr(cfg, 'MATCHER_RANK', 32), heads=getattr(cfg, 'MATCHER_HEADS', 6), topk_k=getattr(cfg, 'MATCHER_TOPK', 12), lambda_dist=getattr(cfg, 'MATCHER_LAMBDA_DIST', 6.0)), in_channels=256, rank=getattr(cfg,'MATCHER_RANK',32), heads=getattr(cfg,'MATCHER_HEADS',6), topk_k=getattr(cfg,'MATCHER_TOPK',12))
-        # Optional distance bias strength
-        self.matcher.lambda_dist = getattr(cfg, 'MATCHER_LAMBDA_DIST', 6.0), in_channels=256, rank=getattr(cfg,'MATCHER_RANK',32), heads=getattr(cfg,'MATCHER_HEADS',6), topk_k=getattr(cfg,'MATCHER_TOPK',12)), in_channels=in_ch, rank=rank, heads=heads)
+        self.scorenet1 = ScoreNet(in_channels=C, heads=heads, rank=rank)
+        self.scorenet2 = ScoreNet(in_channels=C, heads=heads, rank=rank)
 
-        # Back-compat: expose scorenet1/2 so utils.test_generate still works
-
-        # Preserve the same learnable bin score parameter that original code used
-        bin_score = torch.nn.Parameter(torch.tensor(1.))
-        self.register_parameter('bin_score', bin_score)
+        # Same learnable bin score as original
+        self.bin_score = nn.Parameter(torch.tensor(1.0))
 
     def forward(self, image: torch.Tensor, tgt: torch.Tensor):
-        """Keeps the original external contract.
-        Returns `(preds_f, perm_mat)` with the same shapes/dtypes as before.
-        """
-        # Encode / decode exactly as before
-        encoder_out = self.encoder(image)
-        preds_f, feats = self.decoder(encoder_out, tgt)
+        enc = self.encoder(image)
+        preds_f, feats = self.decoder(enc, tgt)
 
-        # --- New head path ---
-        # Build per-vertex (y,x) coords from tokens for spatial priors
-        # Expect tgt: [B, L] of token ids; bins in [0, NUM_BINS)
-        try:
-            seq = tgt[:, 1:]  # drop BOS/CLS to mirror matcher folding
-            y_ids = seq[:, 0::2].float()
-            x_ids = seq[:, 1::2].float()
-            denom = max(1, int(getattr(self.cfg, 'NUM_BINS', getattr(self.cfg, 'INPUT_HEIGHT', 224)) - 1))
-            xy = torch.stack([y_ids / denom, x_ids / denom], dim=-1)  # [B, N, 2], normalised
-        except Exception:
-            xy = None
+        P1 = self.scorenet1(feats)               # [B, N, N]
+        P2 = self.scorenet2(feats).transpose(1, 2)
+        logits = P1 + P2                          # combine like original
 
-        logits = self.matcher(feats, xy=xy)  # [B, N, N]
-
-        # Call the *existing* log-space OT solver (same as original)
-        # NOTE: function must be present in the surrounding module scope.
-        perm_mat = log_optimal_transport(logits, self.bin_score, self.cfg.SINKHORN_ITERATIONS)
-        # Slice back to [B, N, N] in case solver padded with bins
-        perm_mat = perm_mat[:, :logits.shape[1], :logits.shape[2]]
-        # Final row-softmax (unchanged from original)
-        perm_mat = F.softmax(perm_mat, dim=-1)
-
-        return preds_f, perm_mat
+        perm = log_optimal_transport(logits, self.bin_score, self.cfg.SINKHORN_ITERATIONS)
+        perm = F.softmax(perm, dim=-1)            # BCE expects probabilities
+        return preds_f, perm
 
     @torch.no_grad()
     def predict(self, image: torch.Tensor, tgt: torch.Tensor):
-        """Inference path kept identical to the original: returns (preds, feats).
-        Downstream code that applies Hungarian/OMN externally will keep working.
-        """
-        encoder_out = self.encoder(image)
-        preds, feats = self.decoder.predict(encoder_out, tgt)
+        enc = self.encoder(image)
+        preds, feats = self.decoder.predict(enc, tgt)
         return preds, feats
-
-
-
-# Utils patch:
-
-        # Build permutation scores directly from the matcher (no scorenet1/2)
-        if isinstance(model, torch.nn.parallel.DistributedDataParallel):
-            matcher = model.module.matcher
-        else:
-            matcher = model.matcher
-
-        # Ensure the matcher folds to exactly N=CFG.N_VERTICES vertices:
-        # keep CLS + 2*N tokens from feats (matcher drops CLS and folds pairs).
-        N = CFG.N_VERTICES
-        feats_trim = feats[:, : (2 * N + 1), :]
-
-        # Build per-vertex (y,x) coordinates from the generated token sequence.
-        # Drop BOS, take first 2*N tokens, split into (y,x), normalise by NUM_BINS-1.
-        seq = batch_preds[:, 1:]                       # drop BOS
-        seq = seq[:, : 2 * N]                          # keep exactly 2N tokens
-        y_ids = seq[:, 0::2].float()
-        x_ids = seq[:, 1::2].float()
-        denom = max(1, int(getattr(CFG, "NUM_BINS", getattr(CFG, "INPUT_HEIGHT", 224)) - 1))
-        xy = torch.stack([y_ids / denom, x_ids / denom], dim=-1)   # [B, N, 2] in [0,1]
-
-        # Matcher returns antisymmetric pairwise logits [B, N, N]
-        perm_logits = matcher(feats_trim, xy=xy)
-
-        # Turn scores into a hard permutation with Hungarian
-        perm_preds = scores_to_permutations(perm_logits)
-
