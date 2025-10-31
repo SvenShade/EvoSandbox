@@ -181,15 +181,21 @@ xy = torch.stack([y_ids/denom, x_ids/denom], dim=-1)    # [B,N,2] in [0,1]
 scores = self.scorenet1(feats, xy=xy)   # and similarly for scorenet2
 
 
-# Extra norm after encoder forward:
-enc_tokens = encoder(images)                    # [B, S, Cenc]
+# Stabilising larger ViT backbone:
 
-# 1a) Project to decoder dim if Cenc != Cdec (you likely already do this)
-enc_tokens = self.enc_proj(enc_tokens)          # [B, S, Cdec]
+# in Decoder.__init__(...)
+self.encoder_pos_embed = nn.Parameter(torch.randn(1, encoder_len, dim) * .02)
+self.encoder_pos_drop  = nn.Dropout(p=0.05)
+self.memory_norm       = nn.LayerNorm(dim, eps=1e-6)  # <— add this line
 
-# 1b) NEW: normalize to tame scale drift
-self.enc_norm = getattr(self, "enc_norm", nn.LayerNorm(enc_tokens.size(-1)).to(enc_tokens.device))
-enc_tokens = self.enc_norm(enc_tokens)          # [B, S, Cdec]
+# In decoder.forward, BEFORE (current code)
+# encoder_out = self.encoder_pos_drop(
+#     encoder_out + self.encoder_pos_embed
+# )
 
-# pass enc_tokens to decoder cross-attention
-decoder_outputs = decoder(tgt_tokens, memory=enc_tokens)
+# AFTER (apply norm, then add pos, then dropout)
+encoder_out = self.memory_norm(encoder_out)                  # <— add this line
+encoder_out = self.encoder_pos_drop(
+    encoder_out + self.encoder_pos_embed
+)
+
