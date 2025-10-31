@@ -179,3 +179,17 @@ denom = max(1, int(getattr(cfg, 'NUM_BINS', getattr(cfg, 'INPUT_HEIGHT', 224)) -
 xy = torch.stack([y_ids/denom, x_ids/denom], dim=-1)    # [B,N,2] in [0,1]
 
 scores = self.scorenet1(feats, xy=xy)   # and similarly for scorenet2
+
+
+# Extra norm after encoder forward:
+enc_tokens = encoder(images)                    # [B, S, Cenc]
+
+# 1a) Project to decoder dim if Cenc != Cdec (you likely already do this)
+enc_tokens = self.enc_proj(enc_tokens)          # [B, S, Cdec]
+
+# 1b) NEW: normalize to tame scale drift
+self.enc_norm = getattr(self, "enc_norm", nn.LayerNorm(enc_tokens.size(-1)).to(enc_tokens.device))
+enc_tokens = self.enc_norm(enc_tokens)          # [B, S, Cdec]
+
+# pass enc_tokens to decoder cross-attention
+decoder_outputs = decoder(tgt_tokens, memory=enc_tokens)
