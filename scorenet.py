@@ -170,23 +170,3 @@ denom = max(1, int(getattr(cfg, 'NUM_BINS', getattr(cfg, 'INPUT_HEIGHT', 224)) -
 xy = torch.stack([y_ids/denom, x_ids/denom], dim=-1)    # [B,N,2] in [0,1]
 
 scores = self.scorenet1(feats, xy=xy)   # and similarly for scorenet2
-
-
-# Stabilising larger ViT backbone:
-
-# in Decoder.__init__(...)
-self.encoder_pos_embed = nn.Parameter(torch.randn(1, encoder_len, dim) * .02)
-self.encoder_pos_drop  = nn.Dropout(p=0.05)
-self.memory_norm       = nn.LayerNorm(dim, eps=1e-6)  # <— add this line
-
-# In decoder.forward, BEFORE (current code)
-# encoder_out = self.encoder_pos_drop(
-#     encoder_out + self.encoder_pos_embed
-# )
-
-# AFTER (apply norm, then add pos, then dropout)
-encoder_out = self.memory_norm(encoder_out)                  # <— add this line
-encoder_out = self.encoder_pos_drop(
-    encoder_out + self.encoder_pos_embed
-)
-
