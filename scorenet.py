@@ -3,10 +3,11 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+
 class ScoreNet(nn.Module):
     """
     Drop-in pair scorer for Pix2Poly's OMN:
-      • Input feats: [B, N(+1), C] (BOS/CLS at index 0)
+      • Input feats: [B, N(+1), C] (BOS/CLS at index 0), where C == in_channels.
       • Behavior: drop BOS, fold (y,x) pairs → [B, N, C]
       • Output: raw scores [B, N, N] (combine two heads upstream as P1 + P2^T)
 
@@ -15,12 +16,12 @@ class ScoreNet(nn.Module):
       • Tiny pair nonlinearity (separable MLP + outer product)
       • Soft geometry prior (distance RBF + cosθ/sinθ)  [if xy provided]
       • Angle harmonics (θ, 2θ, 4θ)                      [if xy provided]
-      • PAD-aware masking for geometry biases
+      • PAD/EOS-aware masking for geometry via `mask` ([B,N] bool)
       • Bounded scale knobs for stability (sigmoid param)
     """
     def __init__(
         self,
-        in_channels: int | None = None,   # None -> infer via LazyLinear (works for C=128/256)
+        in_channels: int,                # REQUIRED: decoder hidden size C
         heads: int = 6,
         rank: int = 32,
         pair_hidden: int = 16,
@@ -38,15 +39,14 @@ class ScoreNet(nn.Module):
         self.use_angle_harmonics = use_angle_harmonics
         self.rbf_K = rbf_K
 
-        # Projections (Lazy if C unknown)
-        Linear = nn.LazyLinear if in_channels is None else nn.Linear
-        self.q_proj = Linear(heads * rank, bias=False)     # C -> H*R
-        self.k_proj = Linear(heads * rank, bias=False)     # C -> H*R
+        # Projections
+        self.q_proj = nn.Linear(in_channels, heads * rank, bias=False)  # C -> H*R
+        self.k_proj = nn.Linear(in_channels, heads * rank, bias=False)  # C -> H*R
         self.head_scale = 1.0 / math.sqrt(rank)
 
         # Pair nonlinearity (separable, tiny)
-        self.ph_i = Linear(pair_hidden, bias=True)         # C -> Dp
-        self.ph_j = Linear(pair_hidden, bias=True)         # C -> Dp
+        self.ph_i = nn.Linear(in_channels, pair_hidden, bias=True)      # C -> Dp
+        self.ph_j = nn.Linear(in_channels, pair_hidden, bias=True)      # C -> Dp
         self._alpha_pair = nn.Parameter(torch.tensor(alpha_pair, dtype=torch.float32))
 
         # Soft geometry prior (RBF on distance + direction)
@@ -70,7 +70,7 @@ class ScoreNet(nn.Module):
             self._alpha_angle = nn.Parameter(torch.tensor(alpha_angle, dtype=torch.float32))
 
         # Diagonal bias (pads/self-loops) and bounded global scale
-        self.diag_proj = Linear(1, bias=True)              # C -> 1
+        self.diag_proj = nn.Linear(in_channels, 1, bias=True)           # C -> 1
         self._logit_scale = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
 
     # ----- bounded scalars (keep logits well-conditioned) -----
@@ -90,18 +90,20 @@ class ScoreNet(nn.Module):
         return feats.view(B, L // 2, 2, C).mean(dim=2)      # [B, N, C]
 
     # ----- forward -----
-    def forward(self, feats: torch.Tensor, xy: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        feats: torch.Tensor,
+        xy: torch.Tensor | None = None,       # [B, N, 2] in [0,1]
+        mask: torch.Tensor | None = None,     # [B, N] bool; True where vertex is valid
+    ) -> torch.Tensor:
         """
         feats: [B, N+1, C] (or [B, N, C] if upstream dropped BOS; we still drop index 0)
         xy   : [B, N, 2] in [0,1] (optional; enables geometry & harmonics)
+        mask : [B, N] bool (optional; zeros geometry bias for invalid PAD/EOS vertices)
         returns: [B, N, N] raw scores
         """
         x = self._fold_vertices(feats)                      # [B, N, C]
         B, N, C = x.shape
-
-        # Ensure LazyLinear init (once)
-        if isinstance(self.diag_proj, nn.LazyLinear):
-            _ = self.diag_proj(x.mean(dim=1, keepdim=True))
 
         # (1) Multi-head low-rank bilinear core
         Q = self.q_proj(x).view(B, N, self.H, self.R)       # [B,N,H,R]
@@ -117,15 +119,16 @@ class ScoreNet(nn.Module):
 
         # (3) Soft geometry prior + angle harmonics (if coords provided)
         if xy is not None:
-            # coords in [0,1]
             yv, xv = xy[..., 0], xy[..., 1]                 # [B,N]
             dy = yv.unsqueeze(2) - yv.unsqueeze(1)          # [B,N,N]
             dx = xv.unsqueeze(2) - xv.unsqueeze(1)
             theta = torch.atan2(dy, dx)                     # [-π, π]
 
-            # Heuristic PAD mask: PAD vertices commonly map to (0,0)
-            pad_i = (yv.abs() < 1e-9) & (xv.abs() < 1e-9)   # [B,N]
-            pad_pair = pad_i.unsqueeze(2) | pad_i.unsqueeze(1)  # [B,N,N]
+            # Invalid-pair mask grid from PAD/EOS vertex mask
+            pair_invalid = None
+            if mask is not None:
+                invalid = (~mask.bool())
+                pair_invalid = invalid.unsqueeze(2) | invalid.unsqueeze(1)  # [B,N,N]
 
             if self.use_geometry:
                 r = torch.sqrt(dy * dy + dx * dx + 1e-8)    # [B,N,N] in [0, √2]
@@ -136,7 +139,8 @@ class ScoreNet(nn.Module):
                     dim=-1
                 )                                            # [B,N,N, 2+K+2]
                 G = self.geom_mlp(geom_feat).squeeze(-1)     # [B,N,N]
-                G = G.masked_fill(pad_pair, 0.0)
+                if pair_invalid is not None:
+                    G = G.masked_fill(pair_invalid, 0.0)
                 S = S + self._pos_scale(self._alpha_geom) * G
 
             if self.use_angle_harmonics:
@@ -145,7 +149,8 @@ class ScoreNet(nn.Module):
                 c4, s4 = torch.cos(4.0 * theta), torch.sin(4.0 * theta)
                 ang_feat = torch.stack([c1, s1, c2, s2, c4, s4], dim=-1)  # [B,N,N,6]
                 Hb = self.ang_mlp(ang_feat).squeeze(-1)                   # [B,N,N]
-                Hb = Hb.masked_fill(pad_pair, 0.0)
+                if pair_invalid is not None:
+                    Hb = Hb.masked_fill(pair_invalid, 0.0)
                 S = S + self._pos_scale(self._alpha_angle) * Hb
 
         # (4) Diagonal bias (pads/self-loops) and bounded global scale
@@ -153,6 +158,7 @@ class ScoreNet(nn.Module):
         S = S * self._logit_scale_fn(self._logit_scale)
 
         return S
+
 
 
 
