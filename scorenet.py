@@ -3,11 +3,6 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-import math
-import torch
-from torch import nn
-from torch.nn import functional as F
-
 class ScoreNet(nn.Module):
     """
     Drop-in pair scorer for Pix2Poly's OMN:
@@ -161,12 +156,116 @@ class ScoreNet(nn.Module):
 
 
 
-# In your EncoderDecoder.forward (teacher forcing), build xy:
-seq = tgt[:, 1:]                  # drop BOS
-N   = cfg.N_VERTICES
-seq = seq[:, : 2*N]
-y_ids = seq[:, 0::2].float(); x_ids = seq[:, 1::2].float()
-denom = max(1, int(getattr(cfg, 'NUM_BINS', getattr(cfg, 'INPUT_HEIGHT', 224)) - 1))
-xy = torch.stack([y_ids/denom, x_ids/denom], dim=-1)    # [B,N,2] in [0,1]
+# utils.py
+import torch
 
-scores = self.scorenet1(feats, xy=xy)   # and similarly for scorenet2
+def build_xy_and_mask_from_tokens(tgt: torch.Tensor,
+                                  pad_id: int,
+                                  num_bins_h: int,
+                                  num_bins_w: int,
+                                  n_vertices: int):
+    """
+    tgt: [B, L] Long (BOS at index 0; then (y,x) repeated; then EOS; then PAD)
+    Returns:
+      xy   : [B, N, 2] in [0,1] (y, x)
+      mask : [B, N] boolean, True where vertex is valid
+    Notes:
+      • Uses *the same* dequantization convention as your Tokenizer.dequantize:
+        id / (num_bins-1). No bin-centering offset is added (keeps it consistent).
+      • EOS handling: any pair that straddles or follows EOS is masked out.
+      • PAD handling: any pair containing PAD is masked out.
+    """
+    B, L = tgt.shape
+    device = tgt.device
+    N = n_vertices
+
+    # Drop BOS; take at most 2*N tokens (the model folds pairs in ScoreNet)
+    seq = tgt[:, 1:]                            # [B, L-1]
+    if seq.size(1) < 2 * N:
+        # pad with PAD to avoid view errors in upstream folding (mirrors collate padding behavior)
+        pad = torch.full((B, 2 * N - seq.size(1)), pad_id, device=device, dtype=seq.dtype)
+        seq = torch.cat([seq, pad], dim=1)
+    else:
+        seq = seq[:, : 2 * N]                   # [B, 2N]
+
+    # Reshape into pairs (y, x)
+    pairs = seq.view(B, N, 2)                   # [B, N, 2]
+    y_ids = pairs[..., 0]
+    x_ids = pairs[..., 1]
+
+    # EOS/PAD-aware mask:
+    # A pair is valid iff both tokens are < PAD and != PAD, and appear before the first EOS.
+    # 1) PAD mask
+    non_pad = (y_ids != pad_id) & (x_ids != pad_id)        # [B, N]
+
+    # 2) EOS position (first EOS in the *flat* sequence after BOS)
+    #    Pairs at/after EOS are invalid.
+    #    We rebuild EOS over seq to remain consistent with your postprocess() logic.
+    eos_code = pad_id - 1  # since PAD = num_bins+2, EOS = num_bins+1
+    # mark EOS positions in [B, 2N]
+    is_eos = (seq == eos_code)                              # [B, 2N]
+    # first EOS index per batch (if none, set to 2N)
+    first_eos = torch.where(is_eos.any(dim=1),
+                            is_eos.float().argmax(dim=1),
+                            torch.full((B,), 2 * N, device=device, dtype=torch.long))   # [B]
+    # pair index (0..N-1) corresponds to positions (2*i, 2*i+1) in seq
+    pair_idx = torch.arange(N, device=device).view(1, N) * 2  # [1, N] -> tokens positions
+    # valid if both token positions are strictly before first EOS
+    before_eos = (pair_idx + 1) < first_eos.view(B, 1)        # [B, N]
+
+    mask = non_pad & before_eos                                # [B, N]
+
+    # Dequantize exactly like Tokenizer.dequantize
+    den_y = max(1, int(num_bins_h - 1))
+    den_x = max(1, int(num_bins_w - 1))
+    y = (y_ids.clamp_min(0).float() / den_y).clamp(0.0, 1.0)
+    x = (x_ids.clamp_min(0).float() / den_x).clamp(0.0, 1.0)
+
+    # Zero-out invalid pairs (optional; the mask is what downstream should rely on)
+    y = torch.where(mask, y, torch.zeros_like(y))
+    x = torch.where(mask, x, torch.zeros_like(x))
+
+    xy = torch.stack([y, x], dim=-1)                          # [B, N, 2]
+    return xy, mask
+
+
+# engine.py (train_one_epoch / valid_one_epoch), after:
+y_input = y[:, :-1]
+y_expected = y[:, 1:]
+
+# Build geometry from teacher-forced tokens
+xy, pair_mask = build_xy_and_mask_from_tokens(
+    y_input,
+    pad_id=CFG.PAD_IDX,
+    num_bins_h=CFG.NUM_BINS,        # height bins
+    num_bins_w=CFG.NUM_BINS,        # width bins (your CFG ties these)
+    n_vertices=CFG.N_VERTICES
+)
+
+# If your EncoderDecoder.forward accepts xy/mask and passes them to scorenets:
+preds, perm_mat = model(x, y_input, xy=xy, mask=pair_mask)
+
+
+# utils.py::test_generate (right before calling scorenets)
+# Build geometry from generated tokens
+with torch.no_grad():
+    xy, pair_mask = build_xy_and_mask_from_tokens(
+        batch_preds,                     # [B, 1+2N] incl BOS
+        pad_id=tokenizer.PAD_code,
+        num_bins_h=tokenizer.num_bins,
+        num_bins_w=tokenizer.num_bins,
+        n_vertices=CFG.N_VERTICES
+    )
+
+if isinstance(model, torch.nn.parallel.DistributedDataParallel):
+    m = model.module
+else:
+    m = model
+
+# If using geometry-aware scorenets:
+perm_scores = m.scorenet1(feats, xy=xy, mask=pair_mask) + m.scorenet2(feats, xy=xy, mask=pair_mask).transpose(1, 2)
+
+# Else (original heads):
+# perm_scores = m.scorenet1(feats) + m.scorenet2(feats).transpose(1, 2)
+
+perm_preds = scores_to_permutations(perm_scores)
