@@ -275,3 +275,47 @@ perm_scores = m.scorenet1(feats, xy=xy, mask=pair_mask) + m.scorenet2(feats, xy=
 # perm_scores = m.scorenet1(feats) + m.scorenet2(feats).transpose(1, 2)
 
 perm_preds = scores_to_permutations(perm_scores)
+
+
+# --- add to __init__ ---
+self.use_dominant_orientation = True  # make toggleable
+self._alpha_orient = nn.Parameter(torch.tensor(-2.0))  # sigmoid ~ 0.12 start
+
+# --- add helper inside class ---
+def _theta0(self, xy: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
+    # xy: [B,N,2], mask: [B,N] (True = valid). Returns [B,1,1] radians.
+    with torch.no_grad():
+        B, N, _ = xy.shape
+        if mask is None:
+            m = torch.ones(B, N, dtype=torch.bool, device=xy.device)
+        else:
+            m = mask.bool()
+        cnt = m.sum(dim=1).clamp_min(1)                          # [B]
+        # fallback: if <3 valid, orientation = 0
+        poor = (cnt < 3)
+        # masked mean
+        w = m.unsqueeze(-1).float()
+        mu = (xy * w).sum(dim=1) / (cnt.view(B,1).float() + 1e-8)  # [B,2]
+        X = (xy - mu.unsqueeze(1)) * w                              # [B,N,2]
+        # 2x2 covariance
+        C = torch.einsum('b n d, b n e -> b d e', X, X) / (cnt.view(B,1,1).float() + 1e-8)  # [B,2,2]
+        # eigenvectors (symmetric)
+        evals, evecs = torch.linalg.eigh(C)                         # ascending
+        v = evecs[..., 1]                                           # principal [B,2]
+        theta0 = torch.atan2(v[..., 1], v[..., 0]])                 # [B]
+        theta0 = torch.where(poor, torch.zeros_like(theta0), theta0)
+        return theta0.view(B,1,1)
+
+def _blend(self, x: torch.Tensor, theta0: torch.Tensor) -> torch.Tensor:
+    # return angles expressed relative to theta0, blended by a learnable gate
+    g = torch.sigmoid(self._alpha_orient)  # 0..1
+    # wrap to [-pi,pi]
+    rel = torch.atan2(torch.sin(x - theta0), torch.cos(x - theta0))
+    return (1.0 - g) * x + g * rel
+
+# angle computation in .forward:
+theta = torch.atan2(dy, dx)  # [-pi, pi]
+if self.use_dominant_orientation:
+    theta0 = self._theta0(xy, mask)              # [B,1,1], no grad
+    theta  = self._blend(theta, theta0)          # softly move to relative frame
+
