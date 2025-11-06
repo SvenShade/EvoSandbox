@@ -319,3 +319,99 @@ if self.use_dominant_orientation:
     theta0 = self._theta0(xy, mask)              # [B,1,1], no grad
     theta  = self._blend(theta, theta0)          # softly move to relative frame
 
+
+
+
+*** a/utils.py
+--- b/utils.py
+@@
+ from scipy.optimize import linear_sum_assignment
++import torch
++from torch.cuda.amp import autocast
+ 
+ def scores_to_permutations(scores):
+     # existing (batch) Hungarian – will be bypassed by the per-item trim below
+     ...
+ 
+@@
+-def test_generate(model, x, tokenizer, CFG, device):
+-    model.eval()
+-    with torch.no_grad():
++def test_generate(model, x, tokenizer, CFG, device):
++    model.eval()
++    with torch.no_grad(), autocast():
+         # 1) autoregressive generation (unchanged)
+         ...
+-        # 2) score pairs with the two heads
+-        if isinstance(model, torch.nn.parallel.DistributedDataParallel):
+-            m = model.module
+-        else:
+-            m = model
+-        perm_scores = m.scorenet1(feats) + m.scorenet2(feats).transpose(1, 2)  # [B, N, N]
+-
+-        # 3) batch Hungarian
+-        perm_preds = scores_to_permutations(perm_scores)
+-        return batch_preds.cpu(), confs, perm_preds
++        # 2) score pairs with the two heads
++        m = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
++        perm_scores = m.scorenet1(feats) + m.scorenet2(feats).transpose(1, 2)  # [B, N, N]
++
++        # 3) Hungarian **trimmed per item** by effective vertex count (N_eff)
++        B, N, _ = perm_scores.shape
++        eos_id = tokenizer.EOS_code
++        perm_preds = torch.zeros((B, N, N), dtype=torch.float32, device=perm_scores.device)
++
++        for b in range(B):
++            seq = batch_preds[b, 1:]  # drop BOS
++            # first EOS position in seq
++            eos_pos = (seq == eos_id).nonzero(as_tuple=False)
++            L_eff = eos_pos[0, 0].item() if eos_pos.numel() > 0 else seq.numel()
++            N_eff = max(0, min(N, L_eff // 2))
++            if N_eff == 0:
++                continue
++            Sb = perm_scores[b, :N_eff, :N_eff].detach().float().cpu().numpy()
++            r, c = linear_sum_assignment(-Sb)  # maximize scores
++            P = torch.zeros((N_eff, N_eff), dtype=torch.float32)
++            P[r, c] = 1.0
++            perm_preds[b, :N_eff, :N_eff] = P.to(perm_scores.device)
++
++        return batch_preds.cpu(), confs, perm_preds
+
+
+*** a/predict_inria_coco_val_set.py
+--- b/predict_inria_coco_val_set.py
+@@
+ parser = argparse.ArgumentParser()
+@@
+ parser.add_argument("--batch_size", type=int, default=4)
++parser.add_argument("--viz_every", type=int, default=0,
++                    help="Save visualizations every N batches (0 = off).")
+@@
+ # DataLoader
+-from torch.utils.data import DataLoader
++from torch.utils.data import DataLoader
++import os
++_CPU = os.cpu_count() or 4
+ val_loader = DataLoader(
+     val_ds,
+     batch_size=args.batch_size,
+-    num_workers=2,
++    num_workers=min(8, _CPU),
++    pin_memory=True,
++    persistent_workers=True,
+     collate_fn=partial(collate_fn, max_len=CFG.MAX_LEN, pad_idx=CFG.PAD_IDX),
+     shuffle=False
+ )
+@@
+ for i_batch, batch in enumerate(val_loader):
+     x, y = batch["image"].to(device), batch["label"].to(device)
+-    batch_preds, confs, perm_preds = test_generate(model, x, tokenizer, CFG, device)
++    batch_preds, confs, perm_preds = test_generate(model, x, tokenizer, CFG, device)
+ 
+     # ... your metric code ...
+ 
+-    # Visualization (always)
+-    save_prediction_grid(pred_mask, gt_mask, out_dir, i_batch)
++    # Visualization (optional / throttled)
++    if args.viz_every and (i_batch % args.viz_every == 0):
++        save_prediction_grid(pred_mask, gt_mask, out_dir, i_batch)
