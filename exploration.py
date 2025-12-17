@@ -43,11 +43,12 @@ def _explore_illumination_now(self, state: State) -> chex.Array:
 
     def splat_one(i, canv):
         r = rad[i]
-        # Binary disk (no falloff). If r ~ 0, this yields just the center pixel.
-        kern = (dist_patch <= r).astype(F32)  # (K, K)
 
-        # Stamp with kernel centered at (cy, cx) in original grid
-        # In padded coords, top-left is (cy, cx) because padding is R on each side.
+        # Linear falloff: 1 at center, 0 at radius r, 0 outside.
+        # If r is tiny, this becomes ~0 everywhere; keep a dot at center in that case.
+        kern = jnp.clip(F32(1.0) - dist_patch / (r + eps), 0.0, 1.0)
+        kern = jnp.where(r < F32(0.75), (dist_patch == 0).astype(F32), kern)
+
         y0 = cy[i]
         x0 = cx[i]
 
