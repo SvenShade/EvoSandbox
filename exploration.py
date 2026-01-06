@@ -1,3 +1,19 @@
+def expl_age_map(self, state: State, age_map: chex.Array, *, max_age: int = 255):
+    S = int(self.env_size)
+    age_map = age_map.astype(jnp.int32)
+
+    xy_idx = self.quantise_to_grid(state.p_pos)  # (N,2) [x,y]
+    x = jnp.clip(xy_idx[:, 0], 0, S - 1)
+    y = jnp.clip(xy_idx[:, 1], 0, S - 1)
+    lin = y * S + x  # row-major: age_map.reshape(-1)[lin]
+
+    occ_flat = jnp.zeros((S * S,), dtype=bool).at[lin].set(True)
+    occ = occ_flat.reshape((S, S))
+
+    inc = jnp.minimum(age_map + 1, jnp.int32(max_age))
+    return jnp.where(occ, 0, inc)
+
+
 def _explore_illumination_now(self, state: State) -> chex.Array:
     """
     Current-step illumination map M_t: binary disks (no falloff), summed over agents.
