@@ -6,83 +6,71 @@ from flax import linen as nn
 from jax import lax
 
 
-class FastConv9x9K3S1(nn.Module):
-    """Specialized conv for inputs (..., 9, 9, C_in), kernel 3x3, stride 1, SAME.
+import numpy as np
+import jax
+import jax.numpy as jnp
+from flax import linen as nn
 
-    Returns (..., 9, 9, features). Parameters are learned like nn.Conv.
 
-    This is typically faster than nn.Conv for very small spatial sizes because it:
-      - extracts patches with lax.conv_general_dilated_patches
-      - does one GEMM per call
-    """
-
+class FastConv9x9_C1_K3S1(nn.Module):
+    """Exact 3x3 SAME conv specialized for (...,9,9,1) -> (...,9,9,C_out)."""
     features: int
     use_bias: bool = True
-    dtype: jnp.dtype | None = jnp.bfloat16       # compute dtype (bf16 on GPU)
-    param_dtype: jnp.dtype = jnp.float32         # store params fp32
-    kernel_init: Callable = nn.initializers.lecun_normal()
-    bias_init: Callable = nn.initializers.zeros
-    precision: lax.Precision | None = None
-
-    # Optional: pad the K dimension of GEMM to a multiple of 16 (sometimes helps bf16)
-    pad_to: int | None = 16
+    dtype: jnp.dtype = jnp.bfloat16
+    param_dtype: jnp.dtype = jnp.float32
+    kernel_init: callable = nn.initializers.lecun_normal()
+    bias_init: callable = nn.initializers.zeros
+    pad_to: int | None = 16  # pad K=9 to 16 for bf16 matmul kernels (benchmark!)
 
     @nn.compact
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         x = jnp.asarray(x)
-        if x.shape[-3:-1] != (9, 9):
-            raise ValueError(f"FastConv9x9K3S1 requires (..., 9, 9, C), got {x.shape}.")
-        Cin = x.shape[-1]
-        Cout = self.features
+        if x.shape[-3:] != (9, 9, 1):
+            raise ValueError(f"Expected (...,9,9,1); got {x.shape}")
 
-        # Flatten leading dims into one batch
-        lead_shape = x.shape[:-3]
-        if lead_shape:
-            Bflat = int(np.prod(lead_shape))
-            x2 = x.reshape(Bflat, 9, 9, Cin)
+        lead = x.shape[:-3]
+        if lead:
+            Bflat = int(np.prod(lead))
+            x2 = x.reshape(Bflat, 9, 9, 1)
         else:
-            x2 = x  # (B,9,9,Cin)
+            x2 = x  # (B,9,9,1)
 
-        compute_dtype = x2.dtype if self.dtype is None else self.dtype
-        x2 = x2.astype(compute_dtype)
+        x2 = x2.astype(self.dtype)
 
-        # Extract patches: (Bflat, 9, 9, Cin*3*3) == (Bflat, 9, 9, 9*Cin)
-        patches = lax.conv_general_dilated_patches(
-            lhs=x2,
-            filter_shape=(3, 3),
-            window_strides=(1, 1),
-            padding="SAME",
-            dimension_numbers=("NHWC", "HWIO", "NHWC"),
-            precision=self.precision,
-        )
-        K = 9 * Cin  # contracted dim
+        # Pad once: (B, 11, 11, 1)
+        xp = jnp.pad(x2, ((0,0), (1,1), (1,1), (0,0)))
 
-        # Weight matrix W: (K, Cout)
-        W = self.param("kernel", self.kernel_init, (K, Cout)).astype(self.param_dtype)
-        W = W.astype(compute_dtype)
+        # Collect the 9 shifted views (each is (B,9,9,1)), then stack -> (B,9,9,9)
+        shifts = []
+        for dy in (0, 1, 2):
+            for dx in (0, 1, 2):
+                shifts.append(xp[:, dy:dy+9, dx:dx+9, 0])  # (B,9,9)
+        X9 = jnp.stack(shifts, axis=-1)  # (Bflat, 9, 9, 9)
 
-        # Optional padding of K to help bf16 matmul kernels (try both in benchmarks)
+        # Learned weights: (9, C_out)
+        W = self.param("kernel", self.kernel_init, (9, self.features)).astype(self.param_dtype)
+        W = W.astype(self.dtype)
+
+        # Optional pad to 16 to help bf16 matmul
         if self.pad_to is not None:
-            Kpad = int(self.pad_to * ((K + self.pad_to - 1) // self.pad_to))
-            if Kpad != K:
-                patches = jnp.pad(patches, ((0, 0), (0, 0), (0, 0), (0, Kpad - K)))
-                W = jnp.pad(W, ((0, Kpad - K), (0, 0)))
-                K = Kpad
+            Kpad = int(self.pad_to * ((9 + self.pad_to - 1) // self.pad_to))
+            if Kpad != 9:
+                X9 = jnp.pad(X9, ((0,0),(0,0),(0,0),(0, Kpad-9)))
+                W = jnp.pad(W, ((0, Kpad-9), (0,0)))
 
-        # GEMM: reshape to 2D, multiply, reshape back
-        # patches_2d: (Bflat*81, K), out_2d: (Bflat*81, Cout)
-        patches_2d = patches.reshape(-1, K)
-        out_2d = patches_2d @ W
-        y2 = out_2d.reshape(x2.shape[0], 9, 9, Cout)
+        # One GEMM over last dim: (B*81, K) @ (K, C_out)
+        Bflat = X9.shape[0]
+        K = X9.shape[-1]
+        Y = (X9.reshape(Bflat * 81, K) @ W).reshape(Bflat, 9, 9, self.features)
 
         if self.use_bias:
-            b = self.param("bias", self.bias_init, (Cout,)).astype(self.param_dtype)
-            y2 = y2 + b.astype(compute_dtype)
+            b = self.param("bias", self.bias_init, (self.features,)).astype(self.param_dtype)
+            Y = Y + b.astype(self.dtype)
 
-        # Restore leading dims
-        if lead_shape:
-            return y2.reshape(*lead_shape, 9, 9, Cout)
-        return y2
+        if lead:
+            return Y.reshape(*lead, 9, 9, self.features)
+        return Y
+
 
 
 
