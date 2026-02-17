@@ -1,82 +1,89 @@
+from typing import Callable, Sequence
+import numpy as np
 import jax
 import jax.numpy as jnp
+from flax import linen as nn
 from jax import lax
 
-def make_conv2d_same_stride1_c1_to_cout(
-    H: int,
-    W: int,
-    C_out: int,
-    kernel: jnp.ndarray,
-    bias: jnp.ndarray | None = None,
-):
+
+class FastConv9x9K3S1(nn.Module):
+    """Specialized conv for inputs (..., 9, 9, C_in), kernel 3x3, stride 1, SAME.
+
+    Returns (..., 9, 9, features). Parameters are learned like nn.Conv.
+
+    This is typically faster than nn.Conv for very small spatial sizes because it:
+      - extracts patches with lax.conv_general_dilated_patches
+      - does one GEMM per call
     """
-    x:      (B, N, H, W, 1)   bf16 recommended
-    kernel: (K, K, 1, C_out)  (HWIO)
-    bias:   (C_out,) optional
-    y:      (B, N, H, W, C_out)
 
-    Uses SAME padding, stride=1.
-    """
-    assert kernel.ndim == 4 and kernel.shape[2] == 1 and kernel.shape[3] == C_out
-    K_h, K_w = kernel.shape[0], kernel.shape[1]
+    features: int
+    use_bias: bool = True
+    dtype: jnp.dtype | None = jnp.bfloat16       # compute dtype (bf16 on GPU)
+    param_dtype: jnp.dtype = jnp.float32         # store params fp32
+    kernel_init: Callable = nn.initializers.lecun_normal()
+    bias_init: Callable = nn.initializers.zeros
+    precision: lax.Precision | None = None
 
-    # Precompute SAME padding tuples for (H, W)
-    pad_h = (K_h - 1) // 2
-    pad_w = (K_w - 1) // 2
-    padding = [(pad_h, pad_h), (pad_w, pad_w)]  # SAME when K is odd (e.g. 3)
+    # Optional: pad the K dimension of GEMM to a multiple of 16 (sometimes helps bf16)
+    pad_to: int | None = 16
 
-    # Dimension numbers for NHWC x HWIO -> NHWC
-    dn = lax.conv_dimension_numbers(
-        lhs_shape=(1, H, W, 1),
-        rhs_shape=kernel.shape,
-        dimension_numbers=("NHWC", "HWIO", "NHWC"),
-    )
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        x = jnp.asarray(x)
+        if x.shape[-3:-1] != (9, 9):
+            raise ValueError(f"FastConv9x9K3S1 requires (..., 9, 9, C), got {x.shape}.")
+        Cin = x.shape[-1]
+        Cout = self.features
 
-    # Close over fixed params for efficiency
-    k = kernel
-    b = bias
+        # Flatten leading dims into one batch
+        lead_shape = x.shape[:-3]
+        if lead_shape:
+            Bflat = int(np.prod(lead_shape))
+            x2 = x.reshape(Bflat, 9, 9, Cin)
+        else:
+            x2 = x  # (B,9,9,Cin)
 
-    @jax.jit
-    def apply(x: jnp.ndarray) -> jnp.ndarray:
-        assert x.shape[2:] == (H, W, 1)
-        B, N = x.shape[0], x.shape[1]
+        compute_dtype = x2.dtype if self.dtype is None else self.dtype
+        x2 = x2.astype(compute_dtype)
 
-        # Merge (B,N) into a single batch for conv: (B*N, H, W, 1)
-        x2 = x.reshape(B * N, H, W, 1)
-
-        y2 = lax.conv_general_dilated(
+        # Extract patches: (Bflat, 9, 9, Cin*3*3) == (Bflat, 9, 9, 9*Cin)
+        patches = lax.conv_general_dilated_patches(
             lhs=x2,
-            rhs=k,
+            filter_shape=(3, 3),
             window_strides=(1, 1),
-            padding=padding,
-            dimension_numbers=dn,
-            lhs_dilation=None,
-            rhs_dilation=None,
-            feature_group_count=1,  # regular conv (not depthwise/grouped)
-        )  # (B*N, H, W, C_out)
+            padding="SAME",
+            dimension_numbers=("NHWC", "HWIO", "NHWC"),
+            precision=self.precision,
+        )
+        K = 9 * Cin  # contracted dim
 
-        if b is not None:
-            y2 = y2 + b  # broadcasts over (B*N, H, W)
+        # Weight matrix W: (K, Cout)
+        W = self.param("kernel", self.kernel_init, (K, Cout)).astype(self.param_dtype)
+        W = W.astype(compute_dtype)
 
-        # Restore (B,N,...) shape
-        return y2.reshape(B, N, H, W, C_out)
+        # Optional padding of K to help bf16 matmul kernels (try both in benchmarks)
+        if self.pad_to is not None:
+            Kpad = int(self.pad_to * ((K + self.pad_to - 1) // self.pad_to))
+            if Kpad != K:
+                patches = jnp.pad(patches, ((0, 0), (0, 0), (0, 0), (0, Kpad - K)))
+                W = jnp.pad(W, ((0, Kpad - K), (0, 0)))
+                K = Kpad
 
-    return apply
+        # GEMM: reshape to 2D, multiply, reshape back
+        # patches_2d: (Bflat*81, K), out_2d: (Bflat*81, Cout)
+        patches_2d = patches.reshape(-1, K)
+        out_2d = patches_2d @ W
+        y2 = out_2d.reshape(x2.shape[0], 9, 9, Cout)
 
+        if self.use_bias:
+            b = self.param("bias", self.bias_init, (Cout,)).astype(self.param_dtype)
+            y2 = y2 + b.astype(compute_dtype)
 
-B, N, H, W = 32, 4, 9, 9
-C_out = 16
-K = 3
+        # Restore leading dims
+        if lead_shape:
+            return y2.reshape(*lead_shape, 9, 9, Cout)
+        return y2
 
-key = jax.random.key(0)
-x = jax.random.normal(key, (B, N, H, W, 1), dtype=jnp.bfloat16)
-
-k_key, b_key = jax.random.split(key)
-kernel = jax.random.normal(k_key, (K, K, 1, C_out), dtype=jnp.bfloat16)
-bias = jnp.zeros((C_out,), dtype=jnp.bfloat16)
-
-conv = make_conv2d_same_stride1_c1_to_cout(H, W, C_out, kernel, bias=bias)
-y = conv(x)  # (B, N, H, W, C_out)
 
 
 @@
