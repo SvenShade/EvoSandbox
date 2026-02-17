@@ -12,66 +12,82 @@ import jax.numpy as jnp
 from flax import linen as nn
 
 
-class FastConv9x9_C1_K3S1(nn.Module):
-    """Exact 3x3 SAME conv specialized for (...,9,9,1) -> (...,9,9,C_out)."""
-    features: int
+from typing import Callable
+import numpy as np
+import jax.numpy as jnp
+from flax import linen as nn
+
+
+class FastConv3x3(nn.Module):
+    """3x3 stride-1 conv for inputs (..., H, W, 1) with:
+      - circular padding on rows (H axis)
+      - zero padding (SAME) on cols (W axis)
+
+    Returns (..., H, W, features). Parameters are learned like nn.Conv.
+    Fast path for C_in=1 using 9 shifts + one GEMM.
+    """
+
+    features: int                      # C_out
     use_bias: bool = True
-    dtype: jnp.dtype = jnp.bfloat16
+    dtype: jnp.dtype = jnp.bfloat16    # compute dtype
     param_dtype: jnp.dtype = jnp.float32
-    kernel_init: callable = nn.initializers.lecun_normal()
-    bias_init: callable = nn.initializers.zeros
-    pad_to: int | None = 16  # pad K=9 to 16 for bf16 matmul kernels (benchmark!)
+    kernel_init: Callable = nn.initializers.lecun_normal()
+    bias_init: Callable = nn.initializers.zeros
 
     @nn.compact
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         x = jnp.asarray(x)
-        if x.shape[-3:] != (9, 9, 1):
-            raise ValueError(f"Expected (...,9,9,1); got {x.shape}")
+        if x.ndim < 3:
+            raise ValueError(f"Expected input (..., H, W, C), got {x.shape}.")
+        if x.shape[-1] != 1:
+            raise ValueError(f"FastRadialConv3x3 requires C_in=1, got {x.shape[-1]}.")
 
+        H, W = x.shape[-3], x.shape[-2]
         lead = x.shape[:-3]
+
+        # Flatten leading dims -> (Bflat, H, W, 1)
         if lead:
             Bflat = int(np.prod(lead))
-            x2 = x.reshape(Bflat, 9, 9, 1)
+            x2 = x.reshape(Bflat, H, W, 1)
         else:
-            x2 = x  # (B,9,9,1)
+            x2 = x
 
         x2 = x2.astype(self.dtype)
 
-        # Pad once: (B, 11, 11, 1)
-        xp = jnp.pad(x2, ((0,0), (1,1), (1,1), (0,0)))
+        # --- Hybrid padding: cols SAME (zero), rows CIRCULAR ---
+        # Cols: pad left/right by 1 -> (Bflat, H, W+2, 1)
+        xw = jnp.pad(x2, ((0, 0), (0, 0), (1, 1), (0, 0)))
 
-        # Collect the 9 shifted views (each is (B,9,9,1)), then stack -> (B,9,9,9)
-        shifts = []
-        for dy in (0, 1, 2):
-            for dx in (0, 1, 2):
-                shifts.append(xp[:, dy:dy+9, dx:dx+9, 0])  # (B,9,9)
-        X9 = jnp.stack(shifts, axis=-1)  # (Bflat, 9, 9, 9)
+        # Rows: circular pad top/bottom by 1 -> (Bflat, H+2, W+2, 1)
+        top = xw[:, -1:, :, :]
+        bot = xw[:, :1, :, :]
+        xp = jnp.concatenate([top, xw, bot], axis=1)
+
+        # 9 shifted views (dy,dx in {0,1,2}) -> stack -> (Bflat, H, W, 9)
+        # Note: channel is 1, so we take xp[..., 0] to get (Bflat, H+2, W+2)
+        base = xp[..., 0]
+        shifts = [
+            base[:, dy:dy + H, dx:dx + W]
+            for dy in (0, 1, 2)
+            for dx in (0, 1, 2)
+        ]
+        X9 = jnp.stack(shifts, axis=-1)  # (Bflat, H, W, 9)
 
         # Learned weights: (9, C_out)
-        W = self.param("kernel", self.kernel_init, (9, self.features)).astype(self.param_dtype)
-        W = W.astype(self.dtype)
+        Wmat = self.param("kernel", self.kernel_init, (9, self.features)).astype(self.param_dtype)
+        Wmat = Wmat.astype(self.dtype)
 
-        # Optional pad to 16 to help bf16 matmul
-        if self.pad_to is not None:
-            Kpad = int(self.pad_to * ((9 + self.pad_to - 1) // self.pad_to))
-            if Kpad != 9:
-                X9 = jnp.pad(X9, ((0,0),(0,0),(0,0),(0, Kpad-9)))
-                W = jnp.pad(W, ((0, Kpad-9), (0,0)))
-
-        # One GEMM over last dim: (B*81, K) @ (K, C_out)
-        Bflat = X9.shape[0]
-        K = X9.shape[-1]
-        Y = (X9.reshape(Bflat * 81, K) @ W).reshape(Bflat, 9, 9, self.features)
+        # One GEMM over the last dim: (Bflat*H*W, K) @ (K, C_out)
+        Y = (X9.reshape(-1, K) @ Wmat).reshape(x2.shape[0], H, W, self.features)
 
         if self.use_bias:
             b = self.param("bias", self.bias_init, (self.features,)).astype(self.param_dtype)
             Y = Y + b.astype(self.dtype)
 
+        # Restore leading dims
         if lead:
-            return Y.reshape(*lead, 9, 9, self.features)
+            return Y.reshape(*lead, H, W, self.features)
         return Y
-
-
 
 
 @@
