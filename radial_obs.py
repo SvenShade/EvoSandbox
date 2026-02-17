@@ -6,88 +6,51 @@ from flax import linen as nn
 from jax import lax
 
 
-import numpy as np
-import jax
-import jax.numpy as jnp
-from flax import linen as nn
+# Terrain encoder: patchify 3x3 (stride 1) -> token MLP-mixer (matmul-friendly)
+# Input `ter` is (B, N, view, view, 1) with view=9 by default.
+BN = B * N
+tview = view
+# 3x3 valid patches (stride 1, VALID padding): (BN, Hout, Wout, 9) for C_in=1.
+# Use XLA's patch extractor (im2col) so this works for any `view` without manual slicing.
+b = ter.reshape(BN, tview, tview, 1).astype(jnp.bfloat16)
+patches = jax.lax.conv_general_dilated_patches(
+    b,
+    filter_shape=(3, 3),
+    window_strides=(1, 1),
+    padding="VALID",
+    dimension_numbers=("NHWC", "HWIO", "NHWC"),
+)  # (BN, Hout, Wout, 9)
 
+Hout, Wout = patches.shape[1], patches.shape[2]
+T = Hout * Wout  # tokens = Hout*Wout
+tok = patches.reshape(BN, T, patches.shape[-1])
 
-from typing import Callable
-import numpy as np
-import jax.numpy as jnp
-from flax import linen as nn
+# Per-token embedding (GEMM-friendly).
+C = 16
+tok = nn.Dense(C, kernel_init=orthogonal(np.sqrt(2)))(tok)
+tok = self.act(tok)
 
+# Token-mixing MLP (Mixer-style): mixes across the token dimension with dense layers.
+# This keeps the locality signal from patchification but avoids small convolutions.
+tm = 64  # token-mixing hidden
+y = jnp.swapaxes(tok, 1, 2)  # (BN, C, T)
+y = nn.Dense(tm, kernel_init=orthogonal(np.sqrt(2)))(y)
+y = self.act(y)
+y = nn.Dense(T, kernel_init=orthogonal(np.sqrt(2)))(y)
+y = jnp.swapaxes(y, 1, 2)  # (BN, T, C)
+tok = tok + y
 
-class FastConv3x3(nn.Module):
-    """3x3 stride-1 conv for inputs (..., H, W, 1) with:
-      - circular padding on rows (H axis)
-      - zero padding (SAME) on cols (W axis)
+# Pool tokens to a fixed-size vector per agent.
+tok_mx = jnp.max(tok, axis=1)
+tok_mn = jnp.mean(tok, axis=1)
+ter_vec = jnp.concatenate([tok_mx, tok_mn], axis=-1)  # (BN, 2C)
 
-    Returns (..., H, W, features). Parameters are learned like nn.Conv.
-    Fast path for C_in=1 using 9 shifts + one GEMM.
-    """
+ter_out = 64
+ter_vec = nn.Dense(ter_out, kernel_init=orthogonal(np.sqrt(2)))(ter_vec)
+ter_vec = self.act(ter_vec)
 
-    features: int                      # C_out
-    use_bias: bool = True
-    dtype: jnp.dtype = jnp.bfloat16    # compute dtype
-    param_dtype: jnp.dtype = jnp.float32
-    kernel_init: Callable = nn.initializers.lecun_normal()
-    bias_init: Callable = nn.initializers.zeros
+ter = ter_vec.reshape(B, N, ter_out)
 
-    @nn.compact
-    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        x = jnp.asarray(x)
-        if x.ndim < 3:
-            raise ValueError(f"Expected input (..., H, W, C), got {x.shape}.")
-        if x.shape[-1] != 1:
-            raise ValueError(f"FastRadialConv3x3 requires C_in=1, got {x.shape[-1]}.")
-
-        H, W = x.shape[-3], x.shape[-2]
-        lead = x.shape[:-3]
-
-        # Flatten leading dims -> (Bflat, H, W, 1)
-        if lead:
-            Bflat = int(np.prod(lead))
-            x2 = x.reshape(Bflat, H, W, 1)
-        else:
-            x2 = x
-
-        x2 = x2.astype(self.dtype)
-
-        # --- Hybrid padding: cols SAME (zero), rows CIRCULAR ---
-        # Cols: pad left/right by 1 -> (Bflat, H, W+2, 1)
-        xw = jnp.pad(x2, ((0, 0), (0, 0), (1, 1), (0, 0)))
-
-        # Rows: circular pad top/bottom by 1 -> (Bflat, H+2, W+2, 1)
-        top = xw[:, -1:, :, :]
-        bot = xw[:, :1, :, :]
-        xp = jnp.concatenate([top, xw, bot], axis=1)
-
-        # 9 shifted views (dy,dx in {0,1,2}) -> stack -> (Bflat, H, W, 9)
-        # Note: channel is 1, so we take xp[..., 0] to get (Bflat, H+2, W+2)
-        base = xp[..., 0]
-        shifts = [
-            base[:, dy:dy + H, dx:dx + W]
-            for dy in (0, 1, 2)
-            for dx in (0, 1, 2)
-        ]
-        X9 = jnp.stack(shifts, axis=-1)  # (Bflat, H, W, 9)
-
-        # Learned weights: (9, C_out)
-        Wmat = self.param("kernel", self.kernel_init, (9, self.features)).astype(self.param_dtype)
-        Wmat = Wmat.astype(self.dtype)
-
-        # One GEMM over the last dim: (Bflat*H*W, K) @ (K, C_out)
-        Y = (X9.reshape(-1, K) @ Wmat).reshape(x2.shape[0], H, W, self.features)
-
-        if self.use_bias:
-            b = self.param("bias", self.bias_init, (self.features,)).astype(self.param_dtype)
-            Y = Y + b.astype(self.dtype)
-
-        # Restore leading dims
-        if lead:
-            return Y.reshape(*lead, H, W, self.features)
-        return Y
 
 
 @@
