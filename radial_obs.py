@@ -5,52 +5,50 @@ import jax.numpy as jnp
 from flax import linen as nn
 from jax import lax
 
+import flax.linen as nn
+import jax.numpy as jnp
+import numpy as np
 
-# Terrain encoder: patchify 3x3 (stride 1) -> token MLP-mixer (matmul-friendly)
-# Input `ter` is (B, N, view, view, 1) with view=9 by default.
-BN = B * N
-tview = view
-# 3x3 valid patches (stride 1, VALID padding): (BN, Hout, Wout, 9) for C_in=1.
-# Use XLA's patch extractor (im2col) so this works for any `view` without manual slicing.
-b = ter.reshape(BN, tview, tview, 1).astype(jnp.bfloat16)
-patches = jax.lax.conv_general_dilated_patches(
-    b,
-    filter_shape=(3, 3),
-    window_strides=(1, 1),
-    padding="VALID",
-    dimension_numbers=("NHWC", "HWIO", "NHWC"),
-)  # (BN, Hout, Wout, 9)
 
-Hout, Wout = patches.shape[1], patches.shape[2]
-T = Hout * Wout  # tokens = Hout*Wout
-tok = patches.reshape(BN, T, patches.shape[-1])
 
-# Per-token embedding (GEMM-friendly).
-C = 16
-tok = nn.Dense(C, kernel_init=orthogonal(np.sqrt(2)))(tok)
-tok = self.act(tok)
+class RayMix3(nn.Module):
+    """Cheap 1D 'conv' over rays (axis=2) using depthwise kernel size 3.
+    Input:  (..., R, S, C)
+    Output: (..., R, S, C)
+    """
+    channels: int
 
-# Token-mixing MLP (Mixer-style): mixes across the token dimension with dense layers.
-# This keeps the locality signal from patchification but avoids small convolutions.
-tm = 64  # token-mixing hidden
-y = jnp.swapaxes(tok, 1, 2)  # (BN, C, T)
-y = nn.Dense(tm, kernel_init=orthogonal(np.sqrt(2)))(y)
-y = self.act(y)
-y = nn.Dense(T, kernel_init=orthogonal(np.sqrt(2)))(y)
-y = jnp.swapaxes(y, 1, 2)  # (BN, T, C)
-tok = tok + y
+    @nn.compact
+    def __call__(self, x):
+        # x: (..., R, S, C)
+        C = x.shape[-1]
+        assert C == self.channels, (C, self.channels)
 
-# Pool tokens to a fixed-size vector per agent.
-tok_mx = jnp.max(tok, axis=1)
-tok_mn = jnp.mean(tok, axis=1)
-ter_vec = jnp.concatenate([tok_mx, tok_mn], axis=-1)  # (BN, 2C)
+        # Depthwise kernel weights: (3, C)
+        k = self.param(
+            "k",
+            lambda key, shape: jnp.array(np.array([0.25, 0.5, 0.25], dtype=np.float32))[:, None]
+                           * jnp.ones((1, shape[1]), dtype=jnp.float32),
+            (3, C),
+        )
+        k0, k1, k2 = k[0], k[1], k[2]  # each (C,)
+        up   = jnp.roll(x, shift=+1, axis=-3)
+        down = jnp.roll(x, shift=-1, axis=-3)
 
-ter_out = 64
-ter_vec = nn.Dense(ter_out, kernel_init=orthogonal(np.sqrt(2)))(ter_vec)
-ter_vec = self.act(ter_vec)
+        # broadcast (C,) across (..., R, S, C)
+        out = (up   * k0) + (x * k1) + (down * k2)
+        return out
 
-ter = ter_vec.reshape(B, N, ter_out)
+# 1) cheap per-cell channel lift (this is GEMM-friendly)
+ter = nn.Dense(16, use_bias=False, kernel_init=orthogonal(np.sqrt(2)))(ter)  # (B,N,view,view,16)
 
+# 2) cheap "conv-like" spreading across rays only
+ter = RayMix3(16, edge_mode="replicate")(ter)  # (B,N,view,view,16)
+
+# 3) keep the rest identical
+ter = self.act(ter).reshape(B, N, view, -1)
+ter = nn.Dense(16, kernel_init=orthogonal(np.sqrt(2)))(ter)
+ter = self.act(ter).reshape(B, N, -1)
 
 
 @@
