@@ -10,6 +10,13 @@ import jax.numpy as jnp
 import numpy as np
 
 
+self.obs_slots    = 5  # Fixed neighbor slots (padding when fewer in range)
+# Precompute upper-tri indices for pairwise neighbour geometry (K choose 2).
+_pi, _pj = np.triu_indices(self.obs_slots, k=1)
+self.pair_i = jnp.array(_pi, dtype=jnp.int32)
+self.pair_j = jnp.array(_pj, dtype=jnp.int32)
+
+
 # Invariant neighbour scalars (rotation-invariant features).
 # These are expressed in the same normalised frame as nbor_pos/nbor_vel.
 #   nbor_pos is already / view_rad   -> components in [-1, 1]
