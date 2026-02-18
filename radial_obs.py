@@ -10,6 +10,66 @@ import jax.numpy as jnp
 import numpy as np
 
 
+dim_p = 3
+dim_a = 3
+slots = 5
+view  = 9
+ego_d =  dim_p*3 + dim_a*2 + 2
+per_nbr_d = (dim_p*2 + dim_a + 2 + 4)  # +4 invariant scalars per neighbour
+pair_d    = slots * (slots - 1) // 2
+nbr_main_d = per_nbr_d * slots
+nbr_d = nbr_main_d + pair_d
+ter_d =  view ** 2
+
+
+class MLPTorso(nn.Module):
+    layer_sizes: Sequence[int]
+    activation: str = "relu"
+    use_layer_norm: bool = False
+    activate_final: bool = True
+
+    def setup(self) -> None:
+        self.act = _parse_activation_fn(self.activation)
+
+    @nn.compact
+    def __call__(self, x: chex.Array) -> chex.Array:
+        x     = x.astype(jnp.bfloat16)
+        B,N,D = x.shape
+        ego   = x[...,        : ego_d]
+        nbr_all = x[...,  ego_d : ego_d + nbr_d]
+        nbr_tok = nbr_all[..., :nbr_main_d].reshape(B, N, slots, per_nbr_d)
+        pair    = nbr_all[...,  nbr_main_d: ]  # (B,N,pair_d)
+        ter   = x[..., -ter_d : ].reshape(B, N, view, view, 1)
+
+        ego = nn.Dense(48, kernel_init=orthogonal(np.sqrt(2)))(ego)
+        ego = self.act(ego)
+
+        nbr_tok = nn.Dense(24, kernel_init=orthogonal(np.sqrt(2)))(nbr_tok)
+        nbr_tok = self.act(nbr_tok)
+        nbr_c  = nbr_tok.reshape(B, N, -1)  # Concat
+        nbr_mx = jnp.max(nbr_tok, axis=-2)  # Max pool
+        nbr_mn = jnp.mean(nbr_tok, axis=-2) # Mean pool
+        nbr = jnp.concatenate([nbr_c, nbr_mx, nbr_mn], axis=-1)
+
+        # Pairwise formation geometry (K choose 2 scalars): embed and append.
+        pair = nn.Dense(16, kernel_init=orthogonal(np.sqrt(2)))(pair)
+        pair = self.act(pair)
+        nbr = jnp.concatenate([nbr, pair], axis=-1)
+
+        # ter = nn.Dense(48, kernel_init=orthogonal(np.sqrt(2)))(ter)
+        ter = FastConv3x3(16)(ter)
+        ter = self.act(ter).reshape(B, N, view, -1)
+        ter = nn.Dense(16, kernel_init=orthogonal(np.sqrt(2)))(ter)
+        ter = self.act(ter).reshape(B, N, -1)
+
+        x = jnp.concatenate([ego, nbr, ter], axis=-1)
+        x = nn.Dense(128, kernel_init=orthogonal(np.sqrt(2)))(x)
+        x = self.act(x)
+
+        return x
+
+
+
 self.obs_slots    = 5  # Fixed neighbor slots (padding when fewer in range)
 # Precompute upper-tri indices for pairwise neighbour geometry (K choose 2).
 _pi, _pj = np.triu_indices(self.obs_slots, k=1)
