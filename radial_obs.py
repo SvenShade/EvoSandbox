@@ -10,6 +10,61 @@ import jax.numpy as jnp
 import numpy as np
 
 
+# Invariant neighbour scalars (rotation-invariant features).
+# These are expressed in the same normalised frame as nbor_pos/nbor_vel.
+#   nbor_pos is already / view_rad   -> components in [-1, 1]
+#   nbor_vel is already / max_speed -> components in (roughly) [-1, 1]
+# We scale norms by sqrt(3) so that max norm of a [-1,1]^3 vector maps to ~1.
+sqrt3 = jnp.sqrt(PRE(3.0))
+pos_norm = jnp.linalg.norm(nbor_pos, axis=-1)  # (K,)
+vel_norm = jnp.linalg.norm(nbor_vel, axis=-1)  # (K,)
+
+# range and speed -> [0,1] then map to [-1,1]
+nbor_rng = (jnp.clip(pos_norm / (sqrt3 + self.eps), 0.0, 1.0) * PRE(2.0) - PRE(1.0))
+nbor_spd = (jnp.clip(vel_norm / (sqrt3 + self.eps), 0.0, 1.0) * PRE(2.0) - PRE(1.0))
+
+# radial speed -> signed, scale to [-1,1]
+r_hat = nbor_pos / (pos_norm[:, None] + self.eps)
+radial = jnp.sum(r_hat * nbor_vel, axis=-1)  # (K,)
+nbor_rdot = jnp.clip(radial / (sqrt3 + self.eps), -1.0, 1.0)
+
+# tangential speed -> [0,1] then map to [-1,1]
+u_perp = nbor_vel - radial[:, None] * r_hat
+tang = jnp.linalg.norm(u_perp, axis=-1)
+nbor_tan = (jnp.clip(tang / (sqrt3 + self.eps), 0.0, 1.0) * PRE(2.0) - PRE(1.0))
+
+# Zero invariants for out-of-range neighbours (padding slots).
+nbor_rng  = zero_1d(nbor_rng)
+nbor_spd  = zero_1d(nbor_spd)
+nbor_rdot = zero_1d(nbor_rdot)
+nbor_tan  = zero_1d(nbor_tan)
+
+# Stack invariants per neighbour: (K,4)
+nbor_inv = jnp.stack([nbor_rng, nbor_spd, nbor_rdot, nbor_tan], axis=-1)
+
+# ------------------------------------------------------------------
+# Pairwise formation geometry: neighbour-neighbour distances (K choose 2 scalars).
+# Compute on normalised positions, then scale by 2*sqrt(3) so max separation -> ~1.
+present = ~oor_idxs
+dmat = jnp.linalg.norm(nbor_pos[:, None, :] - nbor_pos[None, :, :], axis=-1)  # (K,K)
+pair_d = dmat[self.pair_i, self.pair_j]  # (P,)
+pair_m = present[self.pair_i] & present[self.pair_j]
+pair_d = jnp.where(pair_m, pair_d, PRE(0.0))
+pair_feat = (jnp.clip(pair_d / (PRE(2.0) * sqrt3 + self.eps), 0.0, 1.0) * PRE(2.0) - PRE(1.0))
+
+nbor_tem = zero_1d(nbor_tem)
+
+# Concatenate self attributes.
+self_ = jnp.concatenate([self_pos, self_vel, self_att, self_fre, self_bat, self_act])
+
+# Concatenate neighbour attributes and flatten.
+nbor_ = jnp.concatenate([nbor_pos, nbor_vel, nbor_att,
+                      nbor_fre[:, None], nbor_tem[:, None], nbor_inv], axis=-1).flatten()
+
+# Append pairwise geometry scalars.
+nbor_ = jnp.concatenate([nbor_, pair_feat], axis=-1)
+
+
 
 class RayMix3(nn.Module):
     """Cheap 1D 'conv' over rays (axis=2) using depthwise kernel size 3.
