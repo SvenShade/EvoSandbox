@@ -283,6 +283,8 @@ class SwarmSetEquivariantTorso(nn.Module):
         # ---- split neighbour per-slot features
         r = nbr_main[..., 0:3]    # (B,N,K,3)
         u = nbr_main[..., 3:6]    # (B,N,K,3)
+        att = nbr_main[..., 6:9]  # (B,N,K,3)
+        att_norm = jnp.linalg.norm(att, axis=-1, keepdims=True)  # (B,N,K,1)
         fre = nbr_main[..., 9:10]   # (B,N,K,1) in [-1,1]
         tem = nbr_main[..., 10:11]  # (B,N,K,1) (0 teammate, 1 opponent, 0 padding)
         inv = nbr_main[..., 11:15]  # (B,N,K,4) in [-1,1], padding=0
@@ -323,8 +325,7 @@ class SwarmSetEquivariantTorso(nn.Module):
         d_mean_s = d_mean_s * mask.astype(d_mean_s.dtype)[..., None]
 
         # ---- invariant token set (rotation-invariant scalars + non-geom flags)
-        # token_in dim = 4(inv) + 1(fre) + 1(tem) + 2(pair summaries) = 8
-        tok_in = jnp.concatenate([inv, fre, tem, d_min_s, d_mean_s], axis=-1)  # (B,N,K,8)
+        tok_in = jnp.concatenate([inv, fre, tem, att, att_norm, d_min_s, d_mean_s], axis=-1)
         tok = nn.Dense(self.d_model, kernel_init=orthogonal(np.sqrt(2)))(tok_in)
         tok = nn.gelu(tok)
         tok = tok * mask.astype(tok.dtype)[..., None]
