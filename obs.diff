@@ -1,0 +1,54 @@
+--- simple_spread_hideseek.py
++++ simple_spread_hideseek.py
+@@ -612,34 +612,39 @@
+         # Vectorise bilinear sampling across agents: -> star: [N,R,S]
+         star = jax.vmap(_bilinear_sample, in_axes=(0, 0, 0))(state.snapshots, x, y).astype(PRE)
+         star_flat = star.reshape((self.num_agnt, W * W))  # [N, R*S]
+ 
++        # Precompute closest-neighbour indices for all agents without full sort.
++        # We want the K smallest distances; lax.top_k returns K largest values, so we take top_k(-dists).
++        K = self.obs_slots
++        dists = jnp.where(sqr_dist > 0.0, sqr_dist, jnp.inf)          # [N, N]
++        _, nbor_idxs_all = jax.lax.top_k(-dists, K)                   # [N, K] (nearest first)
++        dists_k_all = jnp.take_along_axis(dists, nbor_idxs_all, -1)   # [N, K]
++
+         def _obs(i: int):
+-            # Find indices of closest neighbours, nearest first.
+-            dists = jnp.where(sqr_dist[i] > 0.0, sqr_dist[i], jnp.inf)
+-            nbor_idxs = jnp.argsort(dists, axis=-1)[:self.obs_slots]
+-            
+-            # Find difference in velocity and attitude to neighbours.
+-            delta = lambda a : a - a[i, None]
+-            diff_vel_agnt = delta(state.p_vel)
+-            diff_att_agnt = delta(state.attitudes)
+-            diff_tem_agnt = jnp.abs(delta(self.team_ids))
++            # Indices of closest neighbours, nearest first.
++            nbor_idxs = nbor_idxs_all[i]
+ 
+             # Self observations, normalised to [-1, 1].
+             self_pos = (state.p_pos[i] / self.env_size) * 2 - 1
+             self_vel =  state.p_vel[i] / self.max_speed
+             self_att =  state.attitudes[i] * 2 - 1
+             self_fre =  state.fire[i, None].astype(PRE) * 2 - 1
+             self_tem =  self.team_ids[i, None] * 2 - 1
+             self_bat = (state.batt[i, None] / self.init_battery) * 2 - 1
+             self_act =  state.actions[i] # Last action taken
+ 
+             # Delta to closest neighbours, normalised to [-1, 1].
+             # Hide opponents' attitudes.
+-            nbor_pos = diff_pos[i, nbor_idxs]   / self.view_rad
+-            nbor_vel = diff_vel_agnt[nbor_idxs] / self.max_speed
+-            nbor_att = (diff_att_agnt * (1 - diff_tem_agnt)[:, None])[nbor_idxs] 
++            nbor_pos = diff_pos[i, nbor_idxs] / self.view_rad
++            nbor_vel = (state.p_vel[nbor_idxs] - state.p_vel[i]) / self.max_speed
++            diff_tem = jnp.abs(self.team_ids[nbor_idxs] - self.team_ids[i]).astype(PRE)
++            nbor_att = (state.attitudes[nbor_idxs] - state.attitudes[i]) * (PRE(1.0) - diff_tem)[:, None]
+             nbor_fre = state.fire[nbor_idxs].astype(PRE) * 2 - 1
+-            nbor_tem = diff_tem_agnt[nbor_idxs]
+-            # nbor_rnk = jnp.where(diff_tem_agnt[nbor_idxs], 0, )
++            nbor_tem = diff_tem
++            # nbor_rnk = jnp.where(diff_tem, 0, )
+ 
+             # Note any out-of-range neighbour idxs.
+-            oor_idxs = dists[nbor_idxs] == jnp.inf
++            oor_idxs = dists_k_all[i] == jnp.inf
