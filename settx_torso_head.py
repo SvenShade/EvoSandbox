@@ -52,31 +52,23 @@ import numpy as np
 from flax import linen as nn
 from flax.linen.initializers import orthogonal
 
-# TFP-JAX for the transformed distribution in the action head
-from tensorflow_probability.substrates import jax as tfp  # type: ignore
-tfd = tfp.distributions
-tfb = tfp.bijectors
+# =========================
+# Helper functions
+# =========================
 
+import jax
+import jax.numpy as jnp
+from flax import linen as nn
+from flax.linen.initializers import orthogonal
 
-# --------------------------
-# Small utilities
-# --------------------------
 
 def masked_softmax(logits: jnp.ndarray, mask: jnp.ndarray, axis: int = -1, eps: float = 1e-9) -> jnp.ndarray:
-    """Softmax over `axis` with boolean mask.
-
-    logits: (..., K)
-    mask:   (..., K) bool
-
-    Returns probs where masked positions are 0. Safe when all masked (returns all zeros).
-    """
+    """Softmax over `axis` with boolean mask. Masked positions -> 0. Safe when all masked."""
     logits = jnp.asarray(logits)
     mask = mask.astype(bool)
-
     very_neg = jnp.array(-1e9, dtype=logits.dtype)
     masked_logits = jnp.where(mask, logits, very_neg)
 
-    # stable exponentiation
     max_logits = jnp.max(masked_logits, axis=axis, keepdims=True)
     exp_logits = jnp.exp(masked_logits - max_logits) * mask.astype(logits.dtype)
     denom = jnp.sum(exp_logits, axis=axis, keepdims=True)
@@ -88,29 +80,50 @@ def safe_normalize(v: jnp.ndarray, axis: int = -1, eps: float = 1e-6) -> jnp.nda
     return v / (n + eps)
 
 
+def make_mask_safe(mask: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Ensure attention never sees an all-masked set.
+    Returns: (mask_safe, mask_any) where
+      mask_safe: same shape as mask, but if all False along K, slot 0 is forced True
+      mask_any: (..., 1) boolean indicating whether any real elements exist
+    """
+    mask = mask.astype(bool)
+    mask_any = jnp.any(mask, axis=-1, keepdims=True)  # (...,1)
+    # Force slot 0 true for empty sets
+    mask_safe = mask.at[..., 0].set(True)
+    mask_safe = jnp.where(mask_any, mask, mask_safe)
+    return mask_safe, mask_any
+
+
+def zero_if_masked(x: jnp.ndarray, mask: jnp.ndarray) -> jnp.ndarray:
+    """Overwrite masked rows with 0 (safe even if x contains NaNs)."""
+    return jnp.where(mask[..., None], x, jnp.array(0.0, dtype=x.dtype))
+
+
+# =========================
+# MLP
+# =========================
+
 class MLP(nn.Module):
     hidden: int
     out: int
 
     @nn.compact
-    def __call__(self, x: chex.Array) -> chex.Array:
-        x = nn.Dense(self.hidden, kernel_init=orthogonal(np.sqrt(2)))(x)
+    def __call__(self, x):
+        x = nn.Dense(self.hidden, kernel_init=orthogonal(jnp.sqrt(2.0)), dtype=jnp.float32, param_dtype=jnp.float32)(x)
         x = nn.gelu(x)
-        x = nn.Dense(self.hidden, kernel_init=orthogonal(np.sqrt(2)))(x)
+        x = nn.Dense(self.hidden, kernel_init=orthogonal(jnp.sqrt(2.0)), dtype=jnp.float32, param_dtype=jnp.float32)(x)
         x = nn.gelu(x)
-        x = nn.Dense(self.out, kernel_init=orthogonal(np.sqrt(2)))(x)
+        x = nn.Dense(self.out, kernel_init=orthogonal(jnp.sqrt(2.0)), dtype=jnp.float32, param_dtype=jnp.float32)(x)
         return x
 
 
-# --------------------------
-# Set Transformer components
-# --------------------------
+# =========================
+# Set Transformer Block (fixed masks + NaN-safe padding)
+# =========================
 
 class SetTransformerBlock(nn.Module):
-    """Pre-norm transformer block over set tokens with correct padding mask.
-
-    x:    (..., K, d_model)
-    mask: (..., K) bool
+    """Pre-norm transformer block over set tokens with padding mask.
+    Supports x shaped (..., K, d_model) and mask shaped (..., K).
     """
 
     d_model: int
@@ -118,36 +131,50 @@ class SetTransformerBlock(nn.Module):
     mlp_hidden: int
 
     @nn.compact
-    def __call__(self, x: chex.Array, mask: chex.Array) -> chex.Array:
+    def __call__(self, x: jnp.ndarray, mask_safe: jnp.ndarray, mask: jnp.ndarray) -> jnp.ndarray:
+        """
+        mask_safe: used ONLY for attention safety (never all-masked)
+        mask:      semantic padding mask (true neighbors only) used to zero outputs
+        """
+        mask_safe = mask_safe.astype(bool)
         mask = mask.astype(bool)
 
-        # Correct self-attn mask: (..., K, K)
-        attn_mask = mask[..., :, None] & mask[..., None, :]
+        # Self-attn mask should be (..., 1, K, K) so it broadcasts to (..., H, K, K)
+        qk = mask_safe[..., :, None] & mask_safe[..., None, :]        # (..., K, K)
+        attn_mask = qk[..., None, :, :]                               # (..., 1, K, K)
 
-        y = nn.LayerNorm()(x)
+        y = nn.LayerNorm(dtype=jnp.float32, param_dtype=jnp.float32)(x)
         y = nn.MultiHeadDotProductAttention(
             num_heads=self.num_heads,
             qkv_features=self.d_model,
             out_features=self.d_model,
             dropout_rate=0.0,
             deterministic=True,
+            dtype=jnp.float32,
+            param_dtype=jnp.float32,
         )(y, y, mask=attn_mask)
+
+        # Critical: overwrite padded QUERY rows before residual add (avoid NaN * 0 leaks)
+        y = zero_if_masked(y, mask)
         x = x + y
 
-        z = nn.LayerNorm()(x)
+        z = nn.LayerNorm(dtype=jnp.float32, param_dtype=jnp.float32)(x)
         z = MLP(hidden=self.mlp_hidden, out=self.d_model)(z)
+        z = zero_if_masked(z, mask)
         x = x + z
 
-        # Hard zero padded tokens so residuals can't leak
-        x = x * mask.astype(x.dtype)[..., None]
+        # Final semantic cleanup
+        x = zero_if_masked(x, mask)
         return x
 
 
-class AttentionPool(nn.Module):
-    """PMA-style pooling: a learned seed query attends over set tokens.
+# =========================
+# AttentionPool (PMA-style; fixed masks + safe empty-set)
+# =========================
 
-    x:    (..., K, d_model)
-    mask: (..., K) bool
+class AttentionPool(nn.Module):
+    """PMA-style pooling: learned seed query attends over set tokens.
+    x: (..., K, d_model), mask_safe/mask: (..., K)
     returns: (..., d_model)
     """
 
@@ -155,15 +182,16 @@ class AttentionPool(nn.Module):
     num_heads: int
 
     @nn.compact
-    def __call__(self, x: chex.Array, mask: chex.Array) -> chex.Array:
-        mask = mask.astype(bool)
+    def __call__(self, x: jnp.ndarray, mask_safe: jnp.ndarray, mask_any: jnp.ndarray) -> jnp.ndarray:
+        mask_safe = mask_safe.astype(bool)
+        # mask_any: (...,1) indicates whether original set had any real members
 
         lead_shape = x.shape[:-2]  # (...)
         seed = self.param("seed", nn.initializers.normal(stddev=0.02), (1, 1, self.d_model))
-        q = jnp.broadcast_to(seed, (*lead_shape, 1, self.d_model))
+        q = jnp.broadcast_to(seed, (*lead_shape, 1, self.d_model)).astype(jnp.float32)  # (...,1,d)
 
-        # Query length is 1: (..., 1, K)
-        attn_mask = mask[..., None, :]
+        # Cross-attn mask: (..., 1, 1, K) to broadcast to (..., H, 1, K)
+        attn_mask = mask_safe[..., None, None, :]  # (...,1,1,K)
 
         pooled = nn.MultiHeadDotProductAttention(
             num_heads=self.num_heads,
@@ -171,9 +199,141 @@ class AttentionPool(nn.Module):
             out_features=self.d_model,
             dropout_rate=0.0,
             deterministic=True,
-        )(q, x, mask=attn_mask)
+            dtype=jnp.float32,
+            param_dtype=jnp.float32,
+        )(q, x, mask=attn_mask)  # (...,1,d)
 
-        return pooled[..., 0, :]
+        pooled = pooled[..., 0, :]  # (...,d)
+
+        # If truly empty set, return zeros (avoid leaking arbitrary seed-attn output)
+        pooled = jnp.where(mask_any, pooled, jnp.zeros_like(pooled))
+        return pooled
+
+
+# =========================
+# SwarmSetEquivariantTorso (returns embedding; aux optionally)
+# =========================
+
+class SwarmSetEquivariantTorso(nn.Module):
+    """
+    Torso implementing:
+      - invariant-token SetTx (formation reasoning)
+      - alpha weights from invariant tokens + ego context
+      - equivariant vector summaries v_r, v_u
+      - scalar context h
+    Returns obs_embedding = concat([h, v_r, v_u])
+    """
+
+    slots: int = 5
+    per_slot_d: int = 15
+    view: int = 9  # terrain is view*view
+    d_model: int = 64
+    num_heads: int = 4
+    mlp_hidden: int = 128
+
+    @nn.compact
+    def __call__(self, obs: jnp.ndarray, return_aux: bool = False):
+        obs = obs.astype(jnp.float32)
+        B, N, D = obs.shape
+
+        pair_d = self.slots * (self.slots - 1) // 2
+        ter_d = self.view * self.view
+        nbr_d = self.slots * self.per_slot_d + pair_d
+        ego_d = D - nbr_d - ter_d
+        if ego_d <= 0:
+            raise ValueError(f"Inferred ego_d={ego_d} not positive. Check layout: D={D}, nbr_d={nbr_d}, ter_d={ter_d}")
+
+        ego = obs[..., :ego_d]                               # (B,N,ego_d)
+        nbr_all = obs[..., ego_d : ego_d + nbr_d]            # (B,N,nbr_d)
+        ter = obs[..., -ter_d :].reshape(B, N, self.view, self.view, 1)  # (B,N,H,W,1) if you still use it elsewhere
+
+        nbr_main = nbr_all[..., : self.slots * self.per_slot_d].reshape(B, N, self.slots, self.per_slot_d)
+        pair = nbr_all[..., self.slots * self.per_slot_d :]  # (B,N,pair_d)
+
+        # ---- split neighbor per-slot features
+        r = nbr_main[..., 0:3]     # (B,N,K,3)
+        u = nbr_main[..., 3:6]     # (B,N,K,3)
+        att = nbr_main[..., 6:9]   # (B,N,K,3) <-- multi-objective attitude delta
+        fre = nbr_main[..., 9:10]  # (B,N,K,1)
+        tem = nbr_main[..., 10:11] # (B,N,K,1)
+        inv = nbr_main[..., 11:15] # (B,N,K,4)
+
+        # semantic padding mask: padding r==0 (your convention)
+        mask = jnp.any(jnp.abs(r) > 1e-6, axis=-1)  # (B,N,K) bool
+
+        # mask_safe prevents all-masked attention; mask_any used to zero pooled output
+        mask_safe, mask_any = make_mask_safe(mask)
+
+        # ---- pairwise summaries computed from r (robust; avoids pair ordering)
+        r_clean = jnp.nan_to_num(r, nan=0.0, posinf=0.0, neginf=0.0)
+        diff = r_clean[..., :, None, :] - r_clean[..., None, :, :]          # (B,N,K,K,3)
+        dist = jnp.linalg.norm(diff, axis=-1)                               # (B,N,K,K)
+
+        pair_mask = mask[..., :, None] & mask[..., None, :]                 # (B,N,K,K)
+        K = self.slots
+        eye = jnp.eye(K, dtype=bool)[None, None, :, :]                      # (1,1,K,K)
+        valid = pair_mask & (~eye)                                          # exclude self
+
+        big = jnp.array(1e9, dtype=dist.dtype)
+        dist_no_self = jnp.where(eye, big, dist)
+
+        d_min = jnp.min(jnp.where(valid, dist_no_self, big), axis=-1, keepdims=True)  # (B,N,K,1)
+        d_sum = jnp.sum(jnp.where(valid, dist, 0.0), axis=-1, keepdims=True)          # (B,N,K,1)
+        cnt = jnp.sum(valid, axis=-1, keepdims=True).astype(dist.dtype)               # (B,N,K,1)
+        d_mean = jnp.where(cnt > 0, d_sum / (cnt + 1e-9), 0.0)                        # (B,N,K,1)
+
+        # ---- invariant tokens (rotation-invariant geometry scalars + task scalars)
+        # attitudes live in objective space (not geometric), safe to include
+        att_norm = jnp.linalg.norm(att, axis=-1, keepdims=True)
+        tok_in = jnp.concatenate([inv, fre, tem, att, att_norm, d_min, d_mean], axis=-1)  # (B,N,K, ?)
+
+        # project tokens
+        tok = nn.Dense(self.d_model, kernel_init=orthogonal(jnp.sqrt(2.0)), dtype=jnp.float32, param_dtype=jnp.float32)(tok_in)
+        tok = nn.gelu(tok)
+        tok = zero_if_masked(tok, mask)  # semantic cleanup
+
+        # ---- SetTx formation cognition (attention uses mask_safe; output cleaned with mask)
+        tok = SetTransformerBlock(d_model=self.d_model, num_heads=self.num_heads, mlp_hidden=self.mlp_hidden)(tok, mask_safe, mask)
+
+        # ---- alpha logits from tok + ego context (broadcast ego_ctx to each slot)
+        ego_ctx = MLP(hidden=self.mlp_hidden, out=self.d_model)(ego)                 # (B,N,d_model)
+        ego_ctx_b = ego_ctx[..., None, :]                                            # (B,N,1,d_model) broadcasts in concat
+        logits = MLP(hidden=self.mlp_hidden, out=1)(jnp.concatenate([tok, ego_ctx_b], axis=-1))[..., 0]  # (B,N,K)
+        alpha = masked_softmax(logits, mask, axis=-1)                                # (B,N,K)
+
+        # ---- equivariant vector summaries (only geometry vectors)
+        alpha3 = alpha[..., None]
+        v_r = jnp.sum(alpha3 * r, axis=-2)  # (B,N,3)
+        v_u = jnp.sum(alpha3 * u, axis=-2)  # (B,N,3)
+
+        # ---- pooled scalar context
+        c = AttentionPool(d_model=self.d_model, num_heads=self.num_heads)(tok, mask_safe, mask_any)  # (B,N,d_model)
+
+        # ---- include pairwise flat features too (since env provides them)
+        pair_emb = nn.Dense(self.d_model, kernel_init=orthogonal(jnp.sqrt(2.0)), dtype=jnp.float32, param_dtype=jnp.float32)(pair)
+        pair_emb = nn.gelu(pair_emb)
+
+        # Scalar/context embedding h
+        h_in = jnp.concatenate([ego, c, pair_emb], axis=-1)
+        h = MLP(hidden=self.mlp_hidden, out=self.mlp_hidden)(h_in)  # (B,N,H)
+
+        obs_embedding = jnp.concatenate([h, v_r, v_u], axis=-1)     # (B,N,H+6)
+
+        if not return_aux:
+            return obs_embedding
+
+        aux = {
+            "mask": mask,
+            "mask_safe": mask_safe,
+            "alpha": alpha,
+            "logits": logits,
+            "v_r": v_r,
+            "v_u": v_u,
+            "d_min": d_min[..., 0],
+            "d_mean": d_mean[..., 0],
+            "att_norm": att_norm[..., 0],
+        }
+        return obs_embedding, aux
 
 
 # --------------------------
@@ -231,162 +391,6 @@ class FastConv3x3(nn.Module):
             return Y.reshape(*lead, H, W, self.features)
         return Y
 
-
-# --------------------------
-# Torso: produces embedding = [h, v_r, v_u]
-# --------------------------
-
-class SwarmSetEquivariantTorso(nn.Module):
-    """Invariant-token SetTx torso + equivariant vector summaries.
-
-    Input obs: (B,N,D) with trailing structure:
-      [ ego (ego_d) , neighbour_main (K*per_slot_d) , pairwise (pair_d) , terrain (view*view) ]
-
-    Returns:
-      obs_embedding: (B,N, h_dim + 6) = concat([h, v_r, v_u])
-      aux: diagnostics dict (alpha, v_r, v_u, mask, etc.)
-    """
-
-    # Observation constants
-    slots: int = 5
-    per_slot_d: int = 15
-    view: int = 9
-
-    # Model sizes
-    d_model: int = 64
-    num_heads: int = 4
-    mlp_hidden: int = 128
-    h_dim: int = 128  # scalar context embedding size (== mlp_hidden by default)
-
-    @nn.compact
-    def __call__(self, obs: chex.Array) -> Tuple[chex.Array, Dict[str, chex.Array]]:
-        obs = obs.astype(jnp.float32)
-        B, N, D = obs.shape
-
-        pair_d = self.slots * (self.slots - 1) // 2
-        ter_d = self.view * self.view
-        nbr_d = self.slots * self.per_slot_d + pair_d
-        ego_d = D - nbr_d - ter_d
-        if ego_d <= 0:
-            raise ValueError(
-                f"Inferred ego_d={ego_d} is not positive. Check observation layout. "
-                f"D={D}, nbr_d={nbr_d}, ter_d={ter_d}."
-            )
-
-        ego = obs[..., :ego_d]
-        nbr_all = obs[..., ego_d : ego_d + nbr_d]
-        ter = obs[..., -ter_d :].reshape(B, N, self.view, self.view, 1)
-
-        nbr_main = nbr_all[..., : self.slots * self.per_slot_d].reshape(B, N, self.slots, self.per_slot_d)
-        pair = nbr_all[..., self.slots * self.per_slot_d :]  # (B,N,pair_d)
-
-        # ---- split neighbour per-slot features
-        r = nbr_main[..., 0:3]    # (B,N,K,3)
-        u = nbr_main[..., 3:6]    # (B,N,K,3)
-        att = nbr_main[..., 6:9]  # (B,N,K,3)
-        att_norm = jnp.linalg.norm(att, axis=-1, keepdims=True)  # (B,N,K,1)
-        fre = nbr_main[..., 9:10]   # (B,N,K,1) in [-1,1]
-        tem = nbr_main[..., 10:11]  # (B,N,K,1) (0 teammate, 1 opponent, 0 padding)
-        inv = nbr_main[..., 11:15]  # (B,N,K,4) in [-1,1], padding=0
-
-        # Padding mask (consistent with env: padded slots have r==0)
-        mask = jnp.any(jnp.abs(r) > 1e-6, axis=-1)  # (B,N,K) bool
-
-        # ---- per-neighbour pairwise summaries from r (rotation-invariant)
-        # distance matrix: (B,N,K,K)
-        diff = r[..., :, None, :] - r[..., None, :, :]
-        d = jnp.linalg.norm(diff, axis=-1)
-
-        # valid pairs for each i: neighbour i and j exist, and j != i
-        eye = jnp.eye(self.slots, dtype=bool)
-        eye = jnp.broadcast_to(eye, (B, N, self.slots, self.slots))
-        valid = (mask[..., :, None] & mask[..., None, :]) & (~eye)
-
-        # min distance to others (per i)
-        huge = jnp.array(1e9, dtype=d.dtype)
-        d_for_min = jnp.where(valid, d, huge)
-        d_min = jnp.min(d_for_min, axis=-1)  # (B,N,K)
-        # count of valid others (per i)
-        cnt = jnp.sum(valid, axis=-1).astype(d.dtype)  # (B,N,K)
-        d_min = jnp.where(cnt > 0, d_min, 0.0)
-
-        # mean distance to others (per i)
-        d_sum = jnp.sum(jnp.where(valid, d, 0.0), axis=-1)
-        d_mean = jnp.where(cnt > 0, d_sum / (cnt + 1e-6), 0.0)
-
-        # scale distances to [-1,1] to match env convention:
-        # r in [-1,1]^3 => max pair distance is 2*sqrt(3)
-        max_d = 2.0 * np.sqrt(3.0)
-        d_min_s = jnp.clip(2.0 * (d_min / max_d) - 1.0, -1.0, 1.0)[..., None]   # (B,N,K,1)
-        d_mean_s = jnp.clip(2.0 * (d_mean / max_d) - 1.0, -1.0, 1.0)[..., None] # (B,N,K,1)
-
-        # ensure padded tokens have 0 summaries
-        d_min_s = d_min_s * mask.astype(d_min_s.dtype)[..., None]
-        d_mean_s = d_mean_s * mask.astype(d_mean_s.dtype)[..., None]
-
-        # ---- invariant token set (rotation-invariant scalars + non-geom flags)
-        tok_in = jnp.concatenate([inv, fre, tem, att, att_norm, d_min_s, d_mean_s], axis=-1)
-        tok = nn.Dense(self.d_model, kernel_init=orthogonal(np.sqrt(2)))(tok_in)
-        tok = nn.gelu(tok)
-        tok = tok * mask.astype(tok.dtype)[..., None]
-
-        # ---- Set Transformer block for formation cognition
-        tok = SetTransformerBlock(d_model=self.d_model, num_heads=self.num_heads, mlp_hidden=self.mlp_hidden)(tok, mask)
-
-        # ---- compute alpha logits from contextual tokens + ego context
-        ego_ctx = MLP(hidden=self.mlp_hidden, out=self.d_model)(ego)  # (B,N,d_model)
-        ego_ctx_b = jnp.broadcast_to(ego_ctx[..., None, :], (B, N, self.slots, self.d_model))
-
-        logits = MLP(hidden=self.mlp_hidden, out=1)(jnp.concatenate([tok, ego_ctx_b], axis=-1))[..., 0]  # (B,N,K)
-        alpha = masked_softmax(logits, mask, axis=-1)  # (B,N,K)
-
-        # ---- equivariant vector summaries
-        alpha3 = alpha[..., None]
-        v_r = jnp.sum(alpha3 * r, axis=-2)  # (B,N,3)
-        v_u = jnp.sum(alpha3 * u, axis=-2)  # (B,N,3)
-
-        # ---- pooled scalar context from token set
-        c = AttentionPool(d_model=self.d_model, num_heads=self.num_heads)(tok, mask)  # (B,N,d_model)
-
-        # ---- terrain embedding
-        t = FastConv3x3(16)(ter)
-        t = nn.gelu(t).reshape(B, N, self.view, -1)
-        t = nn.Dense(16, kernel_init=orthogonal(np.sqrt(2)))(t)
-        t = nn.gelu(t).reshape(B, N, -1)  # (B,N,view*16)
-
-        # ---- embed the provided pairwise formation scalars (10) as global context
-        pair_emb = nn.Dense(self.d_model, kernel_init=orthogonal(np.sqrt(2)))(pair)
-        pair_emb = nn.gelu(pair_emb)
-
-        # ---- scalar context embedding h
-        h_in = jnp.concatenate([ego, c, pair_emb, t], axis=-1)
-        h = MLP(hidden=self.mlp_hidden, out=self.h_dim)(h_in)  # (B,N,h_dim)
-
-        # ---- final embedding for the action head
-        obs_embedding = jnp.concatenate([h, v_r, v_u], axis=-1)  # (B,N,h_dim+6)
-
-        aux = {
-            "mask": mask,
-            "alpha": alpha,
-            "logits": logits,
-            "v_r": v_r,
-            "v_u": v_u,
-            "d_min": d_min_s[..., 0],
-            "d_mean": d_mean_s[..., 0],
-            "pair_emb": pair_emb,
-        }
-        return obs_embedding, aux
-
-
-# --------------------------
-# Action distribution: tanh-squashed Normal
-# --------------------------
-
-class TanhTransformedDistribution(tfd.TransformedDistribution):
-    """Tanh-squashed distribution for actions in [-1,1]."""
-
-    def __init__(self, distribution: tfd.Distribution):
-        super().__init__(distribution=distribution, bijector=tfb.Tanh())
 
 
 class ContinuousActionHead(nn.Module):
