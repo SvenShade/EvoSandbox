@@ -476,6 +476,14 @@ class ContinuousActionHead(nn.Module):
         scale = jax.nn.softplus(scale_raw) + self.min_scale
 
         base_dist = tfd.Normal(loc=loc, scale=scale)
+      
+        jax.debug.print(
+            "loc_accel max={m1} mag mean={m2} conf mean={m3}",
+            m1=jnp.max(jnp.abs(loc_accel)),
+            m2=jnp.mean(magnitude),
+            m3=jnp.mean(confidence),
+        )
+      
         return tfd.Independent(
             TanhTransformedDistribution(base_dist),
             reinterpreted_batch_ndims=1,
