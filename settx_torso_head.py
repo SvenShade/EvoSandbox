@@ -394,64 +394,111 @@ class FastConv3x3(nn.Module):
 
 
 class ContinuousActionHead(nn.Module):
-    """Mava-compatible continuous action head with an equivariant mean.
+    """Hybrid continuous head for action_dim=6:
+       [accel_x, accel_y, accel_z, att_dx, att_dy, att_dz]
 
-    Expects obs_embedding = concat([h, v_r, v_u]) where:
-      - h is scalar/context embedding (rotation-invariant content)
-      - v_r, v_u are equivariant vector summaries in R^3 each
+    Expects:
+      obs_embedding = concat([h, v_r, v_u])
 
-    Mean:
-      loc = action_scale * sigmoid(mag(h)) * normalize( sigmoid(g_r,g_u)(h)[0]*v_r + ... )
-    Std:
-      - independent_std=True: single learned log_std per action dim (broadcast)
-      - independent_std=False: log_std = Dense(h), depending only on h (keeps std rotation-stable)
+    where:
+      h   : scalar/context embedding
+      v_r : equivariant position summary, shape (..., 3)
+      v_u : equivariant velocity summary, shape (..., 3)
+
+    Acceleration mean is structured/equivariant.
+    Attitude-update mean is a standard MLP output from h.
     """
 
-    action_dim: int
+    action_dim: int = 6
     min_scale: float = 1e-3
     independent_std: bool = True
-    action_scale: float = 2.0  # scale before tanh
 
-    def setup(self) -> None:
-        if self.action_dim != 3:
-            raise ValueError("This equivariant head is written for action_dim=3.")
-
-        self.gates = nn.Dense(2, kernel_init=orthogonal(0.01))  # g_r, g_u in (0,1)
-        self.mag = nn.Dense(1, kernel_init=orthogonal(0.01))    # magnitude in (0,1)
-
-        if self.independent_std:
-            self.log_std = self.param("log_std", nn.initializers.zeros, (self.action_dim,))
-        else:
-            self.log_std = nn.Dense(self.action_dim, kernel_init=orthogonal(0.01))
+    # Scales before tanh-transform
+    action_scale_accel: float = 1.0
+    action_scale_att: float = 1.0
 
     @nn.compact
     def __call__(self, obs_embedding: chex.Array, action_mask: chex.Array) -> tfd.Independent:
         del action_mask
+        assert self.action_dim == 6, "This head expects 6 actions: 3 accel + 3 attitude update."
 
-        # Split embedding: last 6 dims are v_r (3) and v_u (3)
+        # Split embedding: last 6 dims are [v_r(3), v_u(3)]
         h = obs_embedding[..., :-6]
         v_r = obs_embedding[..., -6:-3]
         v_u = obs_embedding[..., -3:]
 
-        g = jax.nn.sigmoid(self.gates(h))
+        # ----- Equivariant acceleration mean -----
+        # Gates start near 0.5 with zero bias, which is fine.
+        gates = nn.Dense(
+            2,
+            kernel_init=orthogonal(0.01),
+            bias_init=nn.initializers.zeros,
+            dtype=jnp.float32,
+            param_dtype=jnp.float32,
+            name="gates",
+        )(h)
+        g = jax.nn.sigmoid(gates)
         g_r = g[..., 0:1]
         g_u = g[..., 1:2]
 
         v = g_r * v_r + g_u * v_u
-        direction = safe_normalize(v)                 # (..,3)
-        magnitude = jax.nn.sigmoid(self.mag(h))       # (..,1)
+        v = jnp.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0)
 
-        loc = self.action_scale * magnitude * direction  # (..,3)
+        v_norm = jnp.linalg.norm(v, axis=-1, keepdims=True)
+        direction = safe_normalize(v)
 
-        # Std
+        # Magnitude is deliberately initialized tiny to mimic the old stable head.
+        mag_logits = nn.Dense(
+            1,
+            kernel_init=orthogonal(0.01),
+            bias_init=nn.initializers.constant(-5.0),
+            dtype=jnp.float32,
+            param_dtype=jnp.float32,
+            name="mag",
+        )(h)
+        magnitude = jax.nn.sigmoid(mag_logits)          # ~0.0067 at init
+        confidence = jnp.tanh(v_norm)                   # tiny v -> tiny action
+
+        loc_accel = self.action_scale_accel * magnitude * confidence * direction
+
+        # ----- Attitude update mean -----
+        # This is not geometric, so use a standard linear head from h.
+        loc_att = self.action_scale_att * nn.Dense(
+            3,
+            kernel_init=orthogonal(0.01),
+            bias_init=nn.initializers.zeros,
+            dtype=jnp.float32,
+            param_dtype=jnp.float32,
+            name="att_mean",
+        )(h)
+
+        loc = jnp.concatenate([loc_accel, loc_att], axis=-1)
+
+        # ----- Std head -----
         if self.independent_std:
-            scale_raw = self.log_std * jnp.ones_like(loc)
+            log_std_param = self.param(
+                "log_std",
+                nn.initializers.zeros,
+                (self.action_dim,),
+            )
+            scale_raw = log_std_param * jnp.ones_like(loc)
         else:
-            scale_raw = self.log_std(h)  # depend only on h (rotation-stable)
+            scale_raw = nn.Dense(
+                self.action_dim,
+                kernel_init=orthogonal(0.01),
+                bias_init=nn.initializers.zeros,
+                dtype=jnp.float32,
+                param_dtype=jnp.float32,
+                name="log_std_head",
+            )(h)
+
+        # Numerical safety
+        scale_raw = jnp.nan_to_num(scale_raw, nan=0.0, posinf=5.0, neginf=-20.0)
+        scale_raw = jnp.clip(scale_raw, -20.0, 5.0)
         scale = jax.nn.softplus(scale_raw) + self.min_scale
 
-        distribution = tfd.Normal(loc=loc, scale=scale)
+        base_dist = tfd.Normal(loc=loc, scale=scale)
         return tfd.Independent(
-            TanhTransformedDistribution(distribution),
+            TanhTransformedDistribution(base_dist),
             reinterpreted_batch_ndims=1,
         )
