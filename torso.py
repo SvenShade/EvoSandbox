@@ -1,17 +1,69 @@
-class MLPTorsoSetTxMinimal(nn.Module):
-    """
-    Minimal incremental torso:
-      - keep old MLP-style policy interface
-      - keep old head unchanged
-      - insert ONE SetTx block only in the neighbor token path
+import chex
+import jax.numpy as jnp
+from flax import linen as nn
+from flax.linen.initializers import orthogonal
 
-    Assumed obs layout (matching your updated env):
-      [ ego | slots*per_slot_d | pairwise_dists | terrain ]
-    with:
-      slots = 5
-      per_slot_d = 15
-      pairwise_dists = 10
-      terrain = 9x9 = 81
+
+def zero_masked(x: jnp.ndarray, mask: jnp.ndarray) -> jnp.ndarray:
+    return jnp.where(mask[..., None], x, 0.0)
+
+
+class SetTxBlock(nn.Module):
+    """Padding-safe self-attention block over K neighbor slots."""
+    d_model: int
+    num_heads: int = 4
+    mlp_mult: int = 2
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, mask: jnp.ndarray) -> jnp.ndarray:
+        """
+        x:    (B, N, K, d_model)
+        mask: (B, N, K) bool, True for real neighbor
+        """
+        B, N, K, D = x.shape
+
+        x = x.reshape(B * N, K, D)
+        mask = mask.reshape(B * N, K)
+
+        # Avoid all-masked rows.
+        has_any = jnp.any(mask, axis=-1, keepdims=True)
+        fallback = jnp.zeros_like(mask).at[:, 0].set(True)
+        mask_safe = jnp.where(has_any, mask, fallback)
+
+        attn_mask = nn.make_attention_mask(mask_safe, mask_safe, dtype=jnp.bool_)
+
+        y = nn.LayerNorm()(x)
+        y = nn.SelfAttention(
+            num_heads=self.num_heads,
+            qkv_features=self.d_model,
+            out_features=self.d_model,
+            kernel_init=orthogonal(jnp.sqrt(2.0)),
+            out_kernel_init=orthogonal(0.01),
+            deterministic=True,
+        )(y, mask=attn_mask)
+        y = zero_masked(y, mask)
+        x = x + y
+
+        y = nn.LayerNorm()(x)
+        y = nn.Dense(self.mlp_mult * self.d_model, kernel_init=orthogonal(jnp.sqrt(2.0)))(y)
+        y = nn.gelu(y)
+        y = nn.Dense(self.d_model, kernel_init=orthogonal(0.01))(y)
+        y = zero_masked(y, mask)
+        x = x + y
+
+        x = zero_masked(x, mask)
+        return x.reshape(B, N, K, D)
+
+
+class MLPTorsoSetTx(nn.Module):
+    """
+    Assumed obs layout:
+        [ego | 5 * per_slot_d neighbor features | 10 pairwise features | terrain]
+
+    where:
+        per_slot_d = 15
+        pairwise features = C(5, 2) = 10
+        terrain = view * view
     """
 
     slots: int = 5
@@ -20,90 +72,57 @@ class MLPTorsoSetTxMinimal(nn.Module):
 
     nbr_token_dim: int = 24
     hidden_dim: int = 128
-
-    settx_heads: int = 4
-    settx_mlp_hidden: int = 64
-
     ego_hidden: int = 64
     pair_hidden: int = 32
     ter_hidden: int = 64
 
+    settx_heads: int = 1
+
     @nn.compact
-    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+    def __call__(self, x: chex.Array) -> chex.Array:
         x = x.astype(jnp.float32)
         B, N, D = x.shape
 
-        pair_d = self.slots * (self.slots - 1) // 2
-        ter_d = self.view * self.view
-        nbr_d = self.slots * self.per_slot_d + pair_d
-        ego_d = D - nbr_d - ter_d
-        if ego_d <= 0:
-            raise ValueError(
-                f"Inferred ego_d={ego_d} not positive. "
-                f"Check layout: D={D}, nbr_d={nbr_d}, ter_d={ter_d}"
-            )
+        pair_d  = self.slots * (self.slots - 1) // 2
+        ter_d   = self.view * self.view
+        nbr_d   = self.slots * self.per_slot_d + pair_d
+        ego_d   = D - nbr_d - ter_d
+        ego     = x[..., :ego_d]
+        nbr_all = x[..., ego_d : ego_d + nbr_d]
+        ter     = x[..., -ter_d:]
+        nbr     = nbr_all[..., : self.slots * self.per_slot_d].reshape(B, N, self.slots, self.per_slot_d)
+        pair    = nbr_all[..., self.slots * self.per_slot_d :]
 
-        ego = x[..., :ego_d]                                  # (B,N,ego_d)
-        nbr_all = x[..., ego_d : ego_d + nbr_d]              # (B,N,nbr_d)
-        ter = x[..., -ter_d:]                                # (B,N,81)
+        # Mask from relative position in each slot.
+        r = nbr[..., 0:3]
+        mask = jnp.any(jnp.abs(r) > 1e-6, axis=-1)
 
-        nbr_main = nbr_all[..., : self.slots * self.per_slot_d].reshape(
-            B, N, self.slots, self.per_slot_d
-        )                                                    # (B,N,K,15)
-        pair = nbr_all[..., self.slots * self.per_slot_d :]  # (B,N,10)
-
-        # ------------------------------------------
-        # Neighbor path: this is the only real change
-        # ------------------------------------------
-
-        # Per-slot split; only r is needed for mask.
-        r = nbr_main[..., 0:3]                               # (B,N,K,3)
-        mask = jnp.any(jnp.abs(r) > 1e-6, axis=-1)           # (B,N,K) bool
-
-        # Old-style per-slot embedding
-        nbr_tok = nn.Dense(
-            self.nbr_token_dim,
-            kernel_init=orthogonal(jnp.sqrt(2.0)),
-        )(nbr_main)
+        # Old slot embedding, then one SetTx block.
+        nbr_tok = nn.Dense(self.nbr_token_dim, kernel_init=orthogonal(jnp.sqrt(2.0)))(nbr)
         nbr_tok = nn.gelu(nbr_tok)
-        nbr_tok = zero_if_masked(nbr_tok, mask)
+        nbr_tok = zero_masked(nbr_tok, mask)
 
-        # One tiny SetTx block over the 5 slots
-        flat_tok = nbr_tok.reshape(B * N, self.slots, self.nbr_token_dim)
-        flat_mask = mask.reshape(B * N, self.slots)
-        flat_tok = NeighborSetTxBlock(
+        nbr_tok = SetTxBlock(
             d_model=self.nbr_token_dim,
             num_heads=self.settx_heads,
-            mlp_hidden=self.settx_mlp_hidden,
-        )(flat_tok, flat_mask)
-        nbr_tok = flat_tok.reshape(B, N, self.slots, self.nbr_token_dim)
+        )(nbr_tok, mask)
 
-        # Keep old-style summaries after contextualization
-        nbr_c = nbr_tok.reshape(B, N, self.slots * self.nbr_token_dim)  # slot-order-sensitive path
+        # Preserve old-style summaries after contextualization.
+        nbr_flat = nbr_tok.reshape(B, N, self.slots * self.nbr_token_dim)
 
-        nbr_sum = jnp.sum(zero_if_masked(nbr_tok, mask), axis=-2)
+        nbr_sum = jnp.sum(zero_masked(nbr_tok, mask), axis=-2)
         nbr_cnt = jnp.maximum(jnp.sum(mask, axis=-1, keepdims=True), 1)
         nbr_mean = nbr_sum / nbr_cnt
 
         neg_big = jnp.full_like(nbr_tok, -1e9)
         nbr_max = jnp.max(jnp.where(mask[..., None], nbr_tok, neg_big), axis=-2)
-        nbr_any = jnp.any(mask, axis=-1, keepdims=True)
-        nbr_max = jnp.where(nbr_any, nbr_max, 0.0)
+        nbr_max = jnp.where(jnp.any(mask, axis=-1, keepdims=True), nbr_max, 0.0)
 
-        # ------------------------------------------
-        # Keep the rest old/simple
-        # ------------------------------------------
+        ego_e = nn.gelu(nn.Dense(self.ego_hidden, kernel_init=orthogonal(jnp.sqrt(2.0)))(ego))
+        pair_e = nn.gelu(nn.Dense(self.pair_hidden, kernel_init=orthogonal(jnp.sqrt(2.0)))(pair))
+        ter_e = nn.gelu(nn.Dense(self.ter_hidden, kernel_init=orthogonal(jnp.sqrt(2.0)))(ter))
 
-        ego_e = nn.Dense(self.ego_hidden, kernel_init=orthogonal(jnp.sqrt(2.0)))(ego)
-        ego_e = nn.gelu(ego_e)
-
-        pair_e = nn.Dense(self.pair_hidden, kernel_init=orthogonal(jnp.sqrt(2.0)))(pair)
-        pair_e = nn.gelu(pair_e)
-
-        ter_e = nn.Dense(self.ter_hidden, kernel_init=orthogonal(jnp.sqrt(2.0)))(ter)
-        ter_e = nn.gelu(ter_e)
-
-        z = jnp.concatenate([ego_e, pair_e, ter_e, nbr_c, nbr_mean, nbr_max], axis=-1)
+        z = jnp.concatenate([ego_e, pair_e, ter_e, nbr_flat, nbr_mean, nbr_max], axis=-1)
 
         z = nn.Dense(self.hidden_dim, kernel_init=orthogonal(jnp.sqrt(2.0)))(z)
         z = nn.gelu(z)
