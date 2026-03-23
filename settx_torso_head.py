@@ -414,44 +414,64 @@ def safe_normalize(v: jnp.ndarray, eps: float = 1e-4) -> jnp.ndarray:
     return v / smooth_norm(v, eps=eps)
 
 
+import chex
+import jax
+import jax.numpy as jnp
+from flax import linen as nn
+from flax.linen.initializers import orthogonal
+from tensorflow_probability.substrates import jax as tfp
+
+tfd = tfp.distributions
+
+
+def safe_normalize(v: jnp.ndarray, eps: float = 1e-4) -> jnp.ndarray:
+    """Smooth normalization with epsilon inside sqrt."""
+    sq_norm = jnp.sum(jnp.square(v), axis=-1, keepdims=True)
+    inv_norm = jax.lax.rsqrt(sq_norm + eps)
+    return v * inv_norm
+
+
 class ContinuousActionHead(nn.Module):
-    """Hybrid continuous head for action_dim=6:
-       [accel_x, accel_y, accel_z, att_dx, att_dy, att_dz]
+    """ContinuousActionHead using a transformed Normal distribution.
 
     Expects:
-      obs_embedding = concat([h, v_r, v_u])
+        obs_embedding = concat([h, v_r, v_u])
 
     where:
-      h   : scalar/context embedding
-      v_r : equivariant position summary, shape (..., 3)
-      v_u : equivariant velocity summary, shape (..., 3)
+        h   : scalar/context embedding
+        v_r : equivariant position-like vector summary, shape (..., 3)
+        v_u : equivariant velocity-like vector summary, shape (..., 3)
 
-    Acceleration mean is structured/equivariant.
-    Attitude-update mean is a standard linear head from h.
+    Output actions are in [-1, 1] via tanh transform.
     """
 
     action_dim: int = 6
     min_scale: float = 1e-3
     independent_std: bool = True
 
-    # Scales before tanh-transform
+    # accel / attitude scaling
     action_scale_accel: float = 1.0
     action_scale_att: float = 1.0
 
-    # Smoothing epsilon for norm / normalization
-    norm_eps: float = 1e-4
+    # small residual escape hatch so PPO is not trapped by the structured path
+    accel_residual_scale: float = 0.1
 
     @nn.compact
-    def __call__(self, obs_embedding: chex.Array, action_mask: chex.Array) -> tfd.Independent:
+    def __call__(
+        self,
+        obs_embedding: chex.Array,
+        action_mask: chex.Array,
+    ) -> tfd.Independent:
         del action_mask
-        assert self.action_dim == 6, "This head expects 6 actions: 3 accel + 3 attitude update."
+        assert self.action_dim == 6, "This head assumes 3 accel + 3 attitude outputs."
+        assert obs_embedding.shape[-1] >= 6, "obs_embedding must end with [v_r, v_u]."
 
-        # Split embedding: last 6 dims are [v_r(3), v_u(3)]
+        # Split torso output
         h = obs_embedding[..., :-6]
         v_r = obs_embedding[..., -6:-3]
         v_u = obs_embedding[..., -3:]
 
-        # ----- Equivariant acceleration mean -----
+        # -------- structured equivariant accel path --------
         gates = nn.Dense(
             2,
             kernel_init=orthogonal(0.01),
@@ -467,11 +487,11 @@ class ContinuousActionHead(nn.Module):
         v = g_r * v_r + g_u * v_u
         v = jnp.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # Gradient-safe norm and direction
-        v_norm = smooth_norm(v, eps=self.norm_eps)
+        sq_norm = jnp.sum(jnp.square(v), axis=-1, keepdims=True)
+        v_norm = jnp.sqrt(sq_norm + 1e-4)
         direction = v / v_norm
+        confidence = jnp.tanh(v_norm)
 
-        # Small initial magnitude to mimic old stable head
         mag_logits = nn.Dense(
             1,
             kernel_init=orthogonal(0.01),
@@ -480,12 +500,25 @@ class ContinuousActionHead(nn.Module):
             param_dtype=jnp.float32,
             name="mag",
         )(h)
-        magnitude = jax.nn.sigmoid(mag_logits)   # ~0.0067 at init
-        confidence = jnp.tanh(v_norm)            # tiny v -> tiny action
+        magnitude = jax.nn.sigmoid(mag_logits)
 
-        loc_accel = self.action_scale_accel * magnitude * confidence * direction
+        loc_accel_struct = self.action_scale_accel * magnitude * confidence * direction
 
-        # ----- Attitude update mean -----
+        # -------- residual accel path --------
+        # Lets PPO escape the structured bottleneck if the equivariant path is
+        # initially too weak / too restrictive.
+        loc_accel_resid = self.accel_residual_scale * nn.Dense(
+            3,
+            kernel_init=orthogonal(0.01),
+            bias_init=nn.initializers.zeros,
+            dtype=jnp.float32,
+            param_dtype=jnp.float32,
+            name="accel_resid",
+        )(h)
+
+        loc_accel = loc_accel_struct + loc_accel_resid
+
+        # -------- attitude mean --------
         loc_att = self.action_scale_att * nn.Dense(
             3,
             kernel_init=orthogonal(0.01),
@@ -496,8 +529,10 @@ class ContinuousActionHead(nn.Module):
         )(h)
 
         loc = jnp.concatenate([loc_accel, loc_att], axis=-1)
+        loc = jnp.nan_to_num(loc, nan=0.0, posinf=5.0, neginf=-5.0)
+        loc = jnp.clip(loc, -20.0, 20.0)
 
-        # ----- Std head -----
+        # -------- std head --------
         if self.independent_std:
             log_std_param = self.param(
                 "log_std",
@@ -515,7 +550,6 @@ class ContinuousActionHead(nn.Module):
                 name="log_std_head",
             )(h)
 
-        # Numerical safety
         scale_raw = jnp.nan_to_num(scale_raw, nan=0.0, posinf=5.0, neginf=-20.0)
         scale_raw = jnp.clip(scale_raw, -20.0, 5.0)
         scale = jax.nn.softplus(scale_raw) + self.min_scale
