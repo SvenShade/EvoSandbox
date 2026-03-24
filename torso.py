@@ -8,6 +8,26 @@ def zero_masked(x: jnp.ndarray, mask: jnp.ndarray) -> jnp.ndarray:
     return jnp.where(mask[..., None], x, 0.0)
 
 
+def masked_softmax(logits: jnp.ndarray, mask: jnp.ndarray, axis: int = -1) -> jnp.ndarray:
+    """
+    logits: (..., K)
+    mask:   (..., K) bool
+    returns weights summing to 1 over valid entries, or all zeros if no valid entries
+    """
+    neg_big = jnp.finfo(logits.dtype).min
+    has_any = jnp.any(mask, axis=axis, keepdims=True)
+
+    masked_logits = jnp.where(mask, logits, neg_big)
+    masked_logits = jnp.where(has_any, masked_logits, 0.0)
+
+    weights = nn.softmax(masked_logits, axis=axis)
+    weights = jnp.where(mask, weights, 0.0)
+
+    denom = jnp.sum(weights, axis=axis, keepdims=True)
+    weights = jnp.where(denom > 0, weights / denom, 0.0)
+    return weights
+
+
 class SetTxBlock(nn.Module):
     """One tiny padding-safe self-attention block over K neighbor slots."""
     d_model: int
@@ -54,57 +74,55 @@ class SetTxBlock(nn.Module):
         return x.reshape(B, N, K, D)
 
 
-class EgoCrossAttnPool(nn.Module):
-    """Ego-query attention pooling over contextualized neighbor tokens."""
+class MaskedSoftmaxPool(nn.Module):
+    """
+    Learned masked softmax pooling over neighbor tokens.
+
+    This is the main new patch:
+      scores_k = f(token_k)
+      alpha = softmax(temp * scores_k) over valid slots only
+      pooled = sum_k alpha_k * token_k
+    """
     d_model: int
-    num_heads: int = 4
+    use_layernorm: bool = True
 
     @nn.compact
-    def __call__(self, ego_q: jnp.ndarray, nbr_tok: jnp.ndarray, mask: jnp.ndarray) -> jnp.ndarray:
+    def __call__(self, x: jnp.ndarray, mask: jnp.ndarray) -> jnp.ndarray:
         """
-        ego_q:   (B, N, d_model)
-        nbr_tok: (B, N, K, d_model)
-        mask:    (B, N, K) bool, True for real neighbor
+        x:    (B, N, K, d_model)
+        mask: (B, N, K) bool
+        returns: (B, N, d_model)
         """
-        B, N, K, D = nbr_tok.shape
+        y = nn.LayerNorm()(x) if self.use_layernorm else x
 
-        q = ego_q.reshape(B * N, 1, D)
-        kv = nbr_tok.reshape(B * N, K, D)
-        mask = mask.reshape(B * N, K)
+        scores = nn.Dense(
+            1,
+            kernel_init=orthogonal(0.01),
+            bias_init=nn.initializers.zeros,
+        )(y)[..., 0]  # (B, N, K)
 
-        has_any = jnp.any(mask, axis=-1, keepdims=True)               # (BN, 1)
-        fallback = jnp.zeros_like(mask).at[:, 0].set(True)            # (BN, K)
-        mask_safe = jnp.where(has_any, mask, fallback)
+        # Learnable inverse temperature, initialized near 1.0
+        log_temp = self.param("log_temp", nn.initializers.zeros, ())
+        temp = nn.softplus(log_temp) + 1e-3
 
-        q_valid = jnp.ones((B * N, 1), dtype=jnp.bool_)
-        attn_mask = nn.make_attention_mask(q_valid, mask_safe, dtype=jnp.bool_)
-
-        y = nn.LayerNorm()(q)
-        kv = nn.LayerNorm()(kv)
-
-        y = nn.MultiHeadDotProductAttention(
-            num_heads=self.num_heads,
-            qkv_features=self.d_model,
-            out_features=self.d_model,
-            kernel_init=orthogonal(jnp.sqrt(2.0)),
-            out_kernel_init=orthogonal(0.01),
-            deterministic=True,
-        )(y, kv, mask=attn_mask)
-
-        y = y[:, 0, :]                                # (BN, D)
-        y = jnp.where(has_any, y, 0.0)               # zero if no real neighbors
-        return y.reshape(B, N, D)
+        weights = masked_softmax(temp * scores, mask, axis=-1)  # (B, N, K)
+        pooled = jnp.sum(weights[..., None] * x, axis=-2)       # (B, N, d_model)
+        return pooled
 
 
-class MLPTorsoSetTxAttention(nn.Module):
+class MLPTorsoSetTxSoftPool(nn.Module):
     """
-    Old-style MLP torso +:
-      1) one SetTx block over neighbor slots
-      2) ego-query cross-attn pooling over those neighbor tokens
+    Old-style MLP torso with one minimal SetTx insertion + learned softmax pooling.
 
     Assumed obs layout:
         [ego | 5 * per_slot_d neighbor features | 10 pairwise features | terrain]
+
+    where:
+        per_slot_d = 15
+        pairwise features = C(5, 2) = 10
+        terrain = view * view
     """
+
     slots: int = 5
     per_slot_d: int = 15
     view: int = 9
@@ -116,7 +134,6 @@ class MLPTorsoSetTxAttention(nn.Module):
     ter_hidden: int = 64
 
     settx_heads: int = 4
-    pool_heads: int = 4
 
     @nn.compact
     def __call__(self, x: chex.Array) -> chex.Array:
@@ -136,19 +153,19 @@ class MLPTorsoSetTxAttention(nn.Module):
         nbr_all = x[..., ego_d : ego_d + nbr_d]
         ter = x[..., -ter_d:]
 
-        nbr = nbr_all[..., : self.slots * self.per_slot_d].reshape(B, N, self.slots, self.per_slot_d)
+        nbr = nbr_all[..., : self.slots * self.per_slot_d].reshape(
+            B, N, self.slots, self.per_slot_d
+        )
         pair = nbr_all[..., self.slots * self.per_slot_d :]
 
-        # Padding mask from slot contents.
-        mask = jnp.any(jnp.abs(nbr) > 1e-6, axis=-1)                # (B, N, K)
+        # Mask padded neighbor slots. This assumes padding slots are all-zero.
+        mask = jnp.any(jnp.abs(nbr) > 1e-6, axis=-1)  # (B, N, K)
 
-        # Existing simple encoders.
-        ego_e = nn.gelu(nn.Dense(self.ego_hidden, kernel_init=orthogonal(jnp.sqrt(2.0)))(ego))
-        pair_e = nn.gelu(nn.Dense(self.pair_hidden, kernel_init=orthogonal(jnp.sqrt(2.0)))(pair))
-        ter_e = nn.gelu(nn.Dense(self.ter_hidden, kernel_init=orthogonal(jnp.sqrt(2.0)))(ter))
-
-        # Neighbor tokens -> SetTx contextualization.
-        nbr_tok = nn.Dense(self.nbr_token_dim, kernel_init=orthogonal(jnp.sqrt(2.0)))(nbr)
+        # Neighbor tokens -> contextualize with one SetTx block.
+        nbr_tok = nn.Dense(
+            self.nbr_token_dim,
+            kernel_init=orthogonal(jnp.sqrt(2.0)),
+        )(nbr)
         nbr_tok = nn.gelu(nbr_tok)
         nbr_tok = zero_masked(nbr_tok, mask)
 
@@ -157,7 +174,7 @@ class MLPTorsoSetTxAttention(nn.Module):
             num_heads=self.settx_heads,
         )(nbr_tok, mask)
 
-        # Old summaries preserved.
+        # Existing summaries retained.
         nbr_flat = nbr_tok.reshape(B, N, self.slots * self.nbr_token_dim)
 
         nbr_sum = jnp.sum(zero_masked(nbr_tok, mask), axis=-2)
@@ -168,16 +185,16 @@ class MLPTorsoSetTxAttention(nn.Module):
         nbr_max = jnp.max(jnp.where(mask[..., None], nbr_tok, neg_big), axis=-2)
         nbr_max = jnp.where(jnp.any(mask, axis=-1, keepdims=True), nbr_max, 0.0)
 
-        # New: ego-query attention pooling over neighbor tokens.
-        ego_q = nn.Dense(self.nbr_token_dim, kernel_init=orthogonal(jnp.sqrt(2.0)))(ego_e)
-        nbr_attn = EgoCrossAttnPool(
-            d_model=self.nbr_token_dim,
-            num_heads=self.pool_heads,
-        )(ego_q, nbr_tok, mask)
+        # New learned readout.
+        nbr_soft = MaskedSoftmaxPool(d_model=self.nbr_token_dim)(nbr_tok, mask)
 
-        # Fuse exactly as before, just with one extra summary term.
+        # Keep the rest of the torso old/simple.
+        ego_e = nn.gelu(nn.Dense(self.ego_hidden, kernel_init=orthogonal(jnp.sqrt(2.0)))(ego))
+        pair_e = nn.gelu(nn.Dense(self.pair_hidden, kernel_init=orthogonal(jnp.sqrt(2.0)))(pair))
+        ter_e = nn.gelu(nn.Dense(self.ter_hidden, kernel_init=orthogonal(jnp.sqrt(2.0)))(ter))
+
         z = jnp.concatenate(
-            [ego_e, pair_e, ter_e, nbr_flat, nbr_mean, nbr_max, nbr_attn],
+            [ego_e, pair_e, ter_e, nbr_flat, nbr_mean, nbr_max, nbr_soft],
             axis=-1,
         )
 
