@@ -247,20 +247,20 @@ class MLPTorsoEquivariantLite(nn.Module):
         teamdiff = nbr[..., 10:11]
         inv4     = nbr[..., 11:15]   # [range, speed, radial, tangential]
 
-        del att_rel  # keep the ablation clean for now
-
-        # Padding mask: padded slots are zeroed in the env.
-        mask = jnp.any(jnp.abs(r) > 1e-6, axis=-1)  # (B, N, K)
-
+        # Padding mask
+        mask = jnp.any(jnp.abs(r) > 1e-6, axis=-1)
+        
+        # Attitudes live in objective space, so treat them as invariant/task features.
+        att_norm = jnp.linalg.norm(att_rel, axis=-1, keepdims=True)
+        
         # Ego/world stream
         ego_e = nn.gelu(nn.Dense(self.ego_hidden, kernel_init=orthogonal(jnp.sqrt(2.0)))(ego))
         pair_e = nn.gelu(nn.Dense(self.pair_hidden, kernel_init=orthogonal(jnp.sqrt(2.0)))(pair))
         ter_e = nn.gelu(nn.Dense(self.ter_hidden, kernel_init=orthogonal(jnp.sqrt(2.0)))(ter))
 
-        # Invariant scalar token per neighbor: use only non-geometric scalars + precomputed invariants.
-        inv = jnp.concatenate([fire, teamdiff, inv4], axis=-1)  # (B, N, K, 6)
+        # Invariant scalar token per neighbor
+        inv = jnp.concatenate([fire, teamdiff, inv4, att_rel, att_norm], axis=-1)
         inv = zero_masked(inv, mask)
-
         inv_tok = nn.Dense(
             self.inv_token_dim,
             kernel_init=orthogonal(jnp.sqrt(2.0)),
