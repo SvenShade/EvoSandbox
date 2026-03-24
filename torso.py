@@ -171,7 +171,7 @@ class InvariantVectorReadout(nn.Module):
             bias_init=nn.initializers.zeros,
         )(h)  # (B, N, K, H)
 
-        alpha = masked_softmax(logits, mask, axis=-2)  # softmax over K
+        alpha = masked_softmax(logits, mask[..., None], axis=-2)
 
         v_r = jnp.einsum("bnkh,bnkd->bnhd", alpha, r)  # (B, N, H, 3)
         v_u = jnp.einsum("bnkh,bnkd->bnhd", alpha, u)  # (B, N, H, 3)
