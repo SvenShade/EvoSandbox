@@ -14,8 +14,7 @@ def zero_masked(x: jnp.ndarray, mask: jnp.ndarray) -> jnp.ndarray:
 def masked_softmax(logits: jnp.ndarray, mask: jnp.ndarray, axis: int) -> jnp.ndarray:
     """
     logits: (..., K) or (..., K, H)
-    mask:   same leading dims as logits up to K, bool
-    softmax only over valid entries; returns all zeros if all entries are masked.
+    mask:   same leading dims up to K, bool
     """
     mask = mask.astype(jnp.bool_)
     while mask.ndim < logits.ndim:
@@ -35,12 +34,7 @@ def masked_softmax(logits: jnp.ndarray, mask: jnp.ndarray, axis: int) -> jnp.nda
     return weights
 
 
-def safe_norm(x: jnp.ndarray, axis: int = -1, eps: float = 1e-6) -> jnp.ndarray:
-    return jnp.sqrt(jnp.sum(jnp.square(x), axis=axis, keepdims=True) + eps)
-
-
 class SetTxBlock(nn.Module):
-    """One small masked self-attention block over invariant neighbor tokens."""
     d_model: int
     num_heads: int = 4
     mlp_mult: int = 2
@@ -85,7 +79,6 @@ class SetTxBlock(nn.Module):
 
 
 class MaskedSoftmaxPool(nn.Module):
-    """Learned masked softmax pooling over tokens."""
     d_model: int
     use_layernorm: bool = True
 
@@ -107,7 +100,7 @@ class MaskedSoftmaxPool(nn.Module):
         log_temp = self.param("log_temp", nn.initializers.zeros, ())
         temp = jax.nn.softplus(log_temp) + 1e-3
 
-        weights = masked_softmax(temp * scores, mask, axis=-1)  # (B, N, K)
+        weights = masked_softmax(temp * scores, mask, axis=-1)
         pooled = jnp.sum(weights[..., None] * x, axis=-2)
         return pooled
 
@@ -115,7 +108,6 @@ class MaskedSoftmaxPool(nn.Module):
 class EgoAdditivePool(nn.Module):
     """
     GATv2/Bahdanau-style additive ego-conditioned pool over tokens.
-    This is the cleanest place to re-introduce ego-conditioned selection.
     """
     d_model: int
     hidden_dim: int | None = None
@@ -130,14 +122,14 @@ class EgoAdditivePool(nn.Module):
         """
         hid = self.hidden_dim or self.d_model
 
-        q = nn.Dense(hid, kernel_init=orthogonal(jnp.sqrt(2.0)))(ego_q)[:, :, None, :]  # (B,N,1,H)
-        k = nn.Dense(hid, kernel_init=orthogonal(jnp.sqrt(2.0)))(x)                      # (B,N,K,H)
+        q = nn.Dense(hid, kernel_init=orthogonal(jnp.sqrt(2.0)))(ego_q)[:, :, None, :]
+        k = nn.Dense(hid, kernel_init=orthogonal(jnp.sqrt(2.0)))(x)
 
         e = nn.Dense(
             1,
             kernel_init=orthogonal(0.01),
             bias_init=nn.initializers.zeros,
-        )(jnp.tanh(q + k))[..., 0]  # (B,N,K)
+        )(jnp.tanh(q + k))[..., 0]  # (B, N, K)
 
         alpha = masked_softmax(e, mask, axis=-1)
         pooled = jnp.sum(alpha[..., None] * x, axis=-2)
@@ -146,10 +138,7 @@ class EgoAdditivePool(nn.Module):
 
 class InvariantVectorReadout(nn.Module):
     """
-    Produce H invariant-derived attention heads alpha_i^(h),
-    then form equivariant-lite vector summaries:
-        v_r^(h) = sum_i alpha_i^(h) r_i
-        v_u^(h) = sum_i alpha_i^(h) u_i
+    Build attention heads from invariant tokens, then form weighted sums of raw vectors.
     """
     token_dim: int
     num_heads: int = 2
@@ -158,13 +147,13 @@ class InvariantVectorReadout(nn.Module):
     @nn.compact
     def __call__(
         self,
-        inv_tok: jnp.ndarray,   # (B,N,K,D)
-        ego_ctx: jnp.ndarray,   # (B,N,De)
-        r: jnp.ndarray,         # (B,N,K,3)
-        u: jnp.ndarray,         # (B,N,K,3)
-        mask: jnp.ndarray,      # (B,N,K)
+        inv_tok: jnp.ndarray,   # (B, N, K, D)
+        ego_ctx: jnp.ndarray,   # (B, N, De)
+        r: jnp.ndarray,         # (B, N, K, 3)
+        u: jnp.ndarray,         # (B, N, K, 3)
+        mask: jnp.ndarray,      # (B, N, K)
     ):
-        B, N, K, D = inv_tok.shape
+        B, N, K, _ = inv_tok.shape
 
         if self.use_ego_context:
             ego_h = nn.Dense(self.token_dim, kernel_init=orthogonal(jnp.sqrt(2.0)))(ego_ctx)
@@ -180,12 +169,12 @@ class InvariantVectorReadout(nn.Module):
             self.num_heads,
             kernel_init=orthogonal(0.01),
             bias_init=nn.initializers.zeros,
-        )(h)  # (B,N,K,H)
+        )(h)  # (B, N, K, H)
 
         alpha = masked_softmax(logits, mask, axis=-2)  # softmax over K
 
-        v_r = jnp.einsum("bnkh,bnkd->bnhd", alpha, r)  # (B,N,H,3)
-        v_u = jnp.einsum("bnkh,bnkd->bnhd", alpha, u)  # (B,N,H,3)
+        v_r = jnp.einsum("bnkh,bnkd->bnhd", alpha, r)  # (B, N, H, 3)
+        v_u = jnp.einsum("bnkh,bnkd->bnhd", alpha, u)  # (B, N, H, 3)
 
         v_r = v_r.reshape(B, N, 3 * self.num_heads)
         v_u = v_u.reshape(B, N, 3 * self.num_heads)
@@ -194,19 +183,17 @@ class InvariantVectorReadout(nn.Module):
 
 class MLPTorsoEquivariantLite(nn.Module):
     """
-    Equivariant-lite torso:
-      - ego/world features stay explicit
-      - neighbor invariant scalars get SetTx + learned pooling
-      - invariant-derived weights form vector summaries from raw r,u
-      - old head interface stays unchanged
+    Corrected equivariant-lite torso using the true per-slot layout:
 
-    Assumed obs layout:
-        [ego | 5 * per_slot_d neighbor features | 10 pairwise features | terrain]
+        [r(3), u(3), att_rel(3), fire(1), teamdiff(1), inv4(4)]
 
-    Assumed per-slot layout:
-        slot[..., 0:3]  = relative position r
-        slot[..., 3:6]  = relative velocity u
-        slot[..., 6:]   = non-geometric scalars / flags / type bits
+    Invariant stream:
+        fire, teamdiff, inv4
+
+    Vector stream:
+        r, u
+
+    att_rel is intentionally excluded from the first clean invariant-lite ablation.
     """
 
     slots: int = 5
@@ -225,7 +212,7 @@ class MLPTorsoEquivariantLite(nn.Module):
 
     use_ego_additive_pool: bool = True
 
-    # Optional small slot-sensitive escape hatch over invariant tokens only.
+    # Small slot-sensitive escape hatch over invariant tokens only.
     inv_flat_dim: int = 32
     inv_flat_scale: float = 0.25
 
@@ -247,39 +234,33 @@ class MLPTorsoEquivariantLite(nn.Module):
         nbr_all = x[..., ego_d : ego_d + nbr_d]
         ter = x[..., -ter_d:]
 
-        nbr = nbr_all[..., : self.slots * self.per_slot_d].reshape(B, N, self.slots, self.per_slot_d)
+        nbr = nbr_all[..., : self.slots * self.per_slot_d].reshape(
+            B, N, self.slots, self.per_slot_d
+        )
         pair = nbr_all[..., self.slots * self.per_slot_d :]
 
-        # Padding mask: assumes padded slots are all-zero.
-        mask = jnp.any(jnp.abs(nbr) > 1e-6, axis=-1)  # (B,N,K)
+        # True slot split from env:
+        r        = nbr[..., 0:3]
+        u        = nbr[..., 3:6]
+        att_rel  = nbr[..., 6:9]     # unused in first clean ablation
+        fire     = nbr[..., 9:10]
+        teamdiff = nbr[..., 10:11]
+        inv4     = nbr[..., 11:15]   # [range, speed, radial, tangential]
 
-        # -----------------------------
-        # Ego / world stream (unchanged)
-        # -----------------------------
+        del att_rel  # keep the ablation clean for now
+
+        # Padding mask: padded slots are zeroed in the env.
+        mask = jnp.any(jnp.abs(r) > 1e-6, axis=-1)  # (B, N, K)
+
+        # Ego/world stream
         ego_e = nn.gelu(nn.Dense(self.ego_hidden, kernel_init=orthogonal(jnp.sqrt(2.0)))(ego))
         pair_e = nn.gelu(nn.Dense(self.pair_hidden, kernel_init=orthogonal(jnp.sqrt(2.0)))(pair))
         ter_e = nn.gelu(nn.Dense(self.ter_hidden, kernel_init=orthogonal(jnp.sqrt(2.0)))(ter))
 
-        # ----------------------------------------
-        # Split neighbor slot into vector + scalar
-        # ----------------------------------------
-        r = nbr[..., 0:3]
-        u = nbr[..., 3:6] if self.per_slot_d >= 6 else jnp.zeros_like(r)
-        extra = nbr[..., 6:]  # non-geometric scalars/flags/type bits
-
-        rho = safe_norm(r)                        # |r|
-        sigma = safe_norm(u)                      # |u|
-        r_hat = r / rho
-        radial = jnp.sum(r_hat * u, axis=-1, keepdims=True)
-        tangential = safe_norm(u - radial * r_hat)
-
-        # Invariant scalar token per neighbor.
-        inv = jnp.concatenate([rho, sigma, radial, tangential, extra], axis=-1)
+        # Invariant scalar token per neighbor: use only non-geometric scalars + precomputed invariants.
+        inv = jnp.concatenate([fire, teamdiff, inv4], axis=-1)  # (B, N, K, 6)
         inv = zero_masked(inv, mask)
 
-        # ---------------------------------------------------
-        # Invariant token encoder (this is the SetTx "brains")
-        # ---------------------------------------------------
         inv_tok = nn.Dense(
             self.inv_token_dim,
             kernel_init=orthogonal(jnp.sqrt(2.0)),
@@ -292,9 +273,7 @@ class MLPTorsoEquivariantLite(nn.Module):
             num_heads=self.settx_heads,
         )(inv_tok, mask)
 
-        # ---------------------------------
-        # Invariant summaries / readout
-        # ---------------------------------
+        # Invariant summaries
         inv_sum = jnp.sum(zero_masked(inv_tok, mask), axis=-2)
         inv_cnt = jnp.maximum(jnp.sum(mask, axis=-1, keepdims=True), 1)
         inv_mean = inv_sum / inv_cnt
@@ -310,7 +289,6 @@ class MLPTorsoEquivariantLite(nn.Module):
         else:
             inv_add = jnp.zeros_like(inv_soft)
 
-        # Optional tiny slot-sensitive path over invariant tokens only.
         z_parts = [ego_e, pair_e, ter_e, inv_mean, inv_max, inv_soft, inv_add]
 
         if self.inv_flat_dim > 0:
@@ -320,9 +298,7 @@ class MLPTorsoEquivariantLite(nn.Module):
             inv_flat = self.inv_flat_scale * inv_flat
             z_parts.append(inv_flat)
 
-        # ----------------------------------------------------
-        # Equivariant-lite vector summaries from invariant alphas
-        # ----------------------------------------------------
+        # Equivariant-lite vector summaries from invariant-derived weights
         v_r, v_u, _alpha = InvariantVectorReadout(
             token_dim=self.inv_token_dim,
             num_heads=self.vec_heads,
@@ -331,7 +307,6 @@ class MLPTorsoEquivariantLite(nn.Module):
 
         z_parts.extend([v_r, v_u])
 
-        # Final scalar fusion MLP; old head can consume this unchanged.
         z = jnp.concatenate(z_parts, axis=-1)
 
         z = nn.Dense(self.hidden_dim, kernel_init=orthogonal(jnp.sqrt(2.0)))(z)
