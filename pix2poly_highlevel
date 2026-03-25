@@ -61,7 +61,7 @@ Swap out Inria for AIRS + BONAI, and train Pix2Poly end-to-end:
 * **BONAI** for roof geometry under off-nadir conditions
 * keep the existing encoder-decoder training recipe
 * switch the target from **building footprints** to **roof polygons**
-* (optional) add a lightweight auxiliary roof-mask head to improve dense supervision
+* (optional) add an auxiliary roof-mask head (FPN) to improve dense supervision (where exactly is the roof support?)
 
 Success: model learns roof polygons with training stability comparable to the current Inria setup, and that roof polygons are visually credible on both nadir-style and off-nadir imagery (suggesting that AIRS + BONAI have been balanced)
 
@@ -99,6 +99,7 @@ Success:
 
 Immediate steps:
 - dataset ingestion, normalization, build single-view polygon baseline
+- (optional, alternative) swap out Pix2Poly polygon decoder with a diffusion model (autoregressive -> parallel vertex prediction and refinement), test
 - then move on to multi-view fusion and association
 
 
