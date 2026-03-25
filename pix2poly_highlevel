@@ -1,0 +1,104 @@
+## MVP proposal: Multi-view roof polygons with Pix2Poly
+
+### Motivating hypothesis
+
+A Pix2Poly-based model can produce **better roof polygons in a canonical nadir frame** when it is given both a nadir image and an off-nadir image, **provided the second view is used for semantic roof association rather than low-level pixel matching**. In practice, that means the model should learn to use cross-view cues to stabilize roof boundaries, resolve occlusion, and support later geometry products such as disparity and elevation. Pix2Poly is a good base for this because it is already an end-to-end model for explicit polygon generation from imagery.
+
+This MVP is intentionally narrow. It does **one high-value thing first**: produce a **canonical roof mask and roof polygon**, then extend that with a **cross-view association field** that can become the foundation for disparity and elevation. The proposal avoids jumping straight to full stereo reconstruction, but it still tests the core business question: **does multi-view overhead imagery improve usable roof geometry outputs?**
+
+---
+
+## Scope
+
+### Inputs
+
+One nadir aerial image plus at least one off-nadir aerial image of the same scene.
+
+### Outputs
+
+A canonical nadir-frame:
+
+* roof mask
+* roof polygon
+* cross-view roof association / flow field
+
+### Intended downstream value
+
+If the association field proves stable, it creates a path to:
+
+* disparity-style products
+* roof-relative elevation estimation
+* improved 3D roof modelling
+
+---
+
+## Development plan
+
+### Stage 1 — Dataset preprocessing and unification
+
+Build one internal data format that can ingest three public sources:
+
+* **AIRS** for large-scale nadir roof supervision. It is a roof-segmentation dataset from Christchurch with **7.5 cm imagery** and **over 220,000 buildings**. ([daoqiqi.github.io][2])
+* **BONAI** for roof supervision under oblique viewing. It provides **off-nadir aerial imagery** with **instance-level roof and footprint polygons** plus **roof-to-footprint offset information**. ([GitHub][3])
+* **BANDON** for paired-view association learning. It contains **2,283 image pairs** and includes **BT-flow**, paired segmentation labels, and **ST-offset** labels, making it the right source for cross-view roof matching supervision. ([GitHub][4])
+
+#### Preprocessing deliverables
+
+* Convert all supervision into a **canonical sample format**
+* Standardise ground resolution/scale, crop size, and label/metadata conventions
+* Then, use existing Pix2Poly raster-mask-to-polygon pipeline to obtain standardised roof polygons
+* Define nadir as canonical output frame
+
+Success: a single loader can train on AIRS, BONAI, and BANDON without dataset-specific model code.
+
+---
+
+### Stage 2 — Single-view roof extraction
+
+Swap out Inria for AIRS + BONAI, and train Pix2Poly end-to-end:
+
+* **AIRS** for strong roof segmentation priors
+* **BONAI** for roof geometry under off-nadir conditions
+* keep the existing encoder-decoder training recipe
+* switch the target from **building footprints** to **roof polygons**
+* (optional) add a lightweight auxiliary roof-mask head to improve dense supervision
+
+Success: model learns roof polygons with training stability comparable to the current Inria setup, and that roof polygons are visually credible on both nadir-style and off-nadir imagery (suggesting that AIRS + BONAI have been balanced)
+
+
+---
+
+### Stage 3 — Multi-view association and fusion
+
+Add the second image and the minimum architecture needed to exploit it. Keep Pix2Poly’s polygon head in place, but replace the single-image front end with a small multi-view fusion module:
+
+* a **shared encoder** applied to each view + metadata (e.g. angle, azimuth) -> embedding
+* a **cross-view fusion block** so canonical token features can query/attend to off-nadir features
+* a new **association / flow head** trained on paired-view supervision
+
+The model predicts **one canonical roof polygon** using the additional view/s as evidence
+
+#### Joint training pipeline
+
+- Supervised single-view: AIRS, BONAI, maintain roof extraction performance
+- Supervised paired-view: BANDON, teach cross-view association
+- Unlabeled paired-view: collected nadir+oblique pairs, used for cycle-consistency and weak cross-view regularisation
+
+The model should learn/maintain three abilities:
+
+* roof segmentation
+* roof polygon prediction
+* roof-to-roof multi-view correspondence
+
+Success: 
+- multi-view input outperforms single-view input on extraction quality
+- shows stable cross-view roof association
+- ablations show that the gain comes from fusion and association, not simply from adding more pixels ("what if we switched off cross-view association?")
+- if so, we demonstrate that **multi-view aerial imagery can improve map-ready roof geometry**, providing confidence that the learned representation can support downstream products (e.g. disparity-style roof alignment, elevation, 3D reconstruction)
+
+
+Immediate steps:
+- dataset ingestion, normalization, build single-view polygon baseline
+- then move on to multi-view fusion and association
+
+
