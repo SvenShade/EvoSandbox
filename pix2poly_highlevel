@@ -106,3 +106,61 @@ Immediate steps:
 "UnFlow: Unsupervised Learning of Optical Flow with a Bidirectional Census Loss" https://arxiv.org/pdf/1711.07837
 "Deep Semantic Matching with Foreground Detection and Cycle-Consistency" http://arxiv.org/pdf/2004.00144
 AIRS, BONAI, BANDON
+
+
+Dockerfile at root of custom repo:
+
+# syntax=docker/dockerfile:1
+
+FROM ubuntu:24.04 AS build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    git \
+    ca-certificates \
+    python3 \
+    python3-pip \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY . /src
+
+# Replace these with the real steps for your repo:
+# RUN pip install -r requirements.txt
+# RUN make
+# RUN ./build.sh
+
+FROM ubuntu:24.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY --from=build /src /app
+
+# Replace with the actual startup command
+CMD ["bash"]
+
+.dockerignore:
+.git
+.github
+.gitignore
+__pycache__
+*.pyc
+node_modules
+build
+dist
+.cache
+venv
+.venv
+data
+outputs
+
+build:
+cd /path/to/your/updated-repo
+docker build -t myrepo-custom:2026-03-25 .
+
+export:
+docker save -o myrepo-custom_2026-03-25.tar myrepo-custom:2026-03-25
+docker load -i myrepo-custom_2026-03-25.tar
