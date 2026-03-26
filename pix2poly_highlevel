@@ -230,3 +230,9 @@ echo "Saved: ${OUTPUT_TAR}"
 run:
 chmod +x build_handoff_image.sh
 ./build_handoff_image.sh /absolute/path/to/your/updated/Pix2Poly
+
+
+
+docker pull nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
+docker save -o cuda118-runtime.tar nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
+docker load -i cuda118-runtime.tar
