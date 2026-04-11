@@ -434,10 +434,19 @@ class SimpleSpreadMPE(MultiAgentEnv):
         p_force = p_force.at[:, 2].add(self.gravity + terr_push * self.pgon_terr_gain)
         p_force = jnp.where(state.pg_done[:, None], 0.0, p_force)
 
-        pg_frozen = state.pg_done | pg_land_colls
+        # Integrate pigeons normally, then project any terrain penetration back
+        # to the terrain surface. This prevents birds from rendering underground
+        # if they descend too quickly for the soft avoidance force to catch them.
+        pg_frozen = state.pg_done
         pg_pos, pg_vel = self._integrate_state(p_force, state.pg_pos, state.pg_vel, pg_frozen)
-        pg_vel = pg_vel * (~pg_land_colls)[:, None].astype(PRE)
         pg_vel, _ = self.limit_speed(pg_vel, self.pgon_max_speed)
+
+        pg_xy = jnp.clip(pg_pos[:, :2] / self.env_size, 0.0, 1.0)
+        pg_land_heights_new = sample_hmap(state.hmap, pg_xy)
+        min_pg_z = (pg_land_heights_new + self.nrm_body_rad) * self.env_size
+        penetrated = pg_pos[:, 2] < min_pg_z
+        pg_pos = pg_pos.at[:, 2].set(jnp.maximum(pg_pos[:, 2], min_pg_z))
+        pg_vel = pg_vel.at[:, 2].set(jnp.where(penetrated, jnp.maximum(pg_vel[:, 2], 0.0), pg_vel[:, 2]))
 
         # Update battery / done. Clay pigeons are one-hit kills by default.
         return pg_pos.astype(PRE), pg_vel.astype(PRE), state.pg_batt, state.pg_done
