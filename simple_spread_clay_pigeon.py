@@ -170,7 +170,7 @@ class SimpleSpreadMPE(MultiAgentEnv):
         self.fire_cos     = 0.75 # Angle of fire cone
         self.fire_refr    = 5    # Fire refractory period
         self.obs_slots    = 5
-        self.pgon_obs_slots = min(self.obs_slots, self.num_pgon)
+        self.pgon_obs_slots = self.obs_slots
         self.pgon_init_batt = 1.0
         self.pgon_accel     = self.accel * 0.75
         self.pgon_max_speed = self.max_speed * 0.9
@@ -182,7 +182,8 @@ class SimpleSpreadMPE(MultiAgentEnv):
         self.pair_j       = jnp.array(_pj, dtype=jnp.int32)
         self.agents       = [f"agent_{i}" for i in range(num_agents)]
         assert not num_agents % 2 # Must be even for two teams
-        assert num_agents > self.obs_slots # Must have enough agents to fill slots
+        # Observations always reserve self.obs_slots neighbour slots and zero-pad
+        # when fewer entities exist or are visible.
         self.ts           = num_agents // 2
         if ONE_SWARM:
             self.team_ids = jnp.zeros(num_agents, dtype=jnp.int16)
@@ -231,7 +232,7 @@ class SimpleSpreadMPE(MultiAgentEnv):
         #   Terrain snapshot image
         ego_dim     =  self.dim_p*3 + self.dim_a*2 + 4
         nbor_dim    = (self.dim_p*2 + self.dim_a + 2 + 4) * self.obs_slots
-        pgon_dim    = (self.dim_p*2 + 1 + 4) * self.pgon_obs_slots
+        pgon_dim    = (self.dim_p*2 + 1 + 4) * self.obs_slots
         pair_dim    = self.obs_slots * (self.obs_slots - 1) // 2
         terrain_dim =  self.view_width ** 2
         self.observation_spaces = {
@@ -775,16 +776,31 @@ class SimpleSpreadMPE(MultiAgentEnv):
         star = jax.vmap(_bilinear_sample, in_axes=(0, 0, 0))(state.snapshots, x, y).astype(PRE)
         star_flat = star.reshape((self.num_agnt, W * W))  # [N, R*S]
 
-        # Find closest-neighbour indices for all agents.
+        # Find closest-neighbour indices for all agents. Always reserve
+        # self.obs_slots slots and pad with invalid entries when there are
+        # fewer real neighbours than slots.
+        pad_nbor = max(0, self.obs_slots - self.num_agnt)
         dists = jnp.where(sqr_dist > 0.0, sqr_dist, jnp.inf)
-        _, nbor_idxs_all = jax.lax.top_k(-dists, self.obs_slots)
-        dists_k_all = jnp.take_along_axis(dists, nbor_idxs_all, -1)
+        dists_pad = jnp.pad(dists, ((0, 0), (0, pad_nbor)), constant_values=jnp.inf)
+        diff_pos_pad = jnp.pad(diff_pos, ((0, 0), (0, pad_nbor), (0, 0)))
+        p_vel_pad = jnp.pad(state.p_vel, ((0, pad_nbor), (0, 0)))
+        attitudes_pad = jnp.pad(state.attitudes, ((0, pad_nbor), (0, 0)))
+        team_ids_pad = jnp.pad(self.team_ids, (0, pad_nbor))
+        fire_pad = jnp.pad(state.fire.astype(PRE), (0, pad_nbor))
+        _, nbor_idxs_all = jax.lax.top_k(-dists_pad, self.obs_slots)
+        dists_k_all = jnp.take_along_axis(dists_pad, nbor_idxs_all, -1)
 
-        # Find closest clay-pigeon indices for all agents.
-        if self.pgon_obs_slots > 0:
-            pg_dists = jnp.where(pg_sqr_dist > 0.0, pg_sqr_dist, jnp.inf)
-            _, pgon_idxs_all = jax.lax.top_k(-pg_dists, self.pgon_obs_slots)
-            pg_dists_k_all = jnp.take_along_axis(pg_dists, pgon_idxs_all, -1)
+        # Find closest clay-pigeon indices for all agents. Again, always
+        # reserve self.obs_slots slots and zero-pad when pigeons are absent
+        # or fewer than the preset slot count.
+        pad_pgon = max(0, self.obs_slots - self.num_pgon)
+        pg_dists = jnp.where(pg_sqr_dist > 0.0, pg_sqr_dist, jnp.inf)
+        pg_dists_pad = jnp.pad(pg_dists, ((0, 0), (0, pad_pgon)), constant_values=jnp.inf)
+        pg_diff_pos_pad = jnp.pad(pg_diff_pos, ((0, 0), (0, pad_pgon), (0, 0)))
+        pg_vel_pad = jnp.pad(state.pg_vel, ((0, pad_pgon), (0, 0)))
+        pg_batt_pad = jnp.pad(state.pg_batt, (0, pad_pgon))
+        _, pgon_idxs_all = jax.lax.top_k(-pg_dists_pad, self.obs_slots)
+        pg_dists_k_all = jnp.take_along_axis(pg_dists_pad, pgon_idxs_all, -1)
 
         def _obs(i: int):
             # Indices of closest neighbours, nearest first.
@@ -802,11 +818,11 @@ class SimpleSpreadMPE(MultiAgentEnv):
 
             # Delta to closest neighbours, normalised to [-1, 1].
             # Hide opponents' attitudes.
-            nbor_pos = diff_pos[i, nbor_idxs] / self.view_rad
-            nbor_vel = (state.p_vel[nbor_idxs] - state.p_vel[i]) / self.max_speed
-            diff_tem = jnp.abs(self.team_ids[nbor_idxs] - self.team_ids[i]).astype(PRE)
-            nbor_att = (state.attitudes[nbor_idxs] - state.attitudes[i]) * (PRE(1.0) - diff_tem)[:, None]
-            nbor_fre = state.fire[nbor_idxs].astype(PRE) * 2 - 1
+            nbor_pos = diff_pos_pad[i, nbor_idxs] / self.view_rad
+            nbor_vel = (p_vel_pad[nbor_idxs] - state.p_vel[i]) / self.max_speed
+            diff_tem = jnp.abs(team_ids_pad[nbor_idxs] - self.team_ids[i]).astype(PRE)
+            nbor_att = (attitudes_pad[nbor_idxs] - state.attitudes[i]) * (PRE(1.0) - diff_tem)[:, None]
+            nbor_fre = fire_pad[nbor_idxs] * 2 - 1
             nbor_tem = diff_tem
 
             # Note any out-of-range neighbour idxs.
@@ -851,8 +867,8 @@ class SimpleSpreadMPE(MultiAgentEnv):
             dmat = jnp.linalg.norm(nbor_pos[:, None, :] - nbor_pos[None, :, :], axis=-1)
             pair_d = dmat[self.pair_i, self.pair_j]  # (P,)
             pair_m = present[self.pair_i] & present[self.pair_j]
-            pair_d = jnp.where(pair_m, pair_d, PRE(0.0))
             pair_feat = (jnp.clip(pair_d / (PRE(2.0) * sqrt3 + self.eps), 0.0, 1.0) * PRE(2.0) - PRE(1.0))
+            pair_feat = jnp.where(pair_m, pair_feat, PRE(0.0))
 
             # Concatenate self attributes.
             self_ = jnp.concatenate([
@@ -880,46 +896,43 @@ class SimpleSpreadMPE(MultiAgentEnv):
             nbor_ = jnp.concatenate([nbor_, pair_feat], axis=-1)
 
             # Clay pigeons: separate channel so agent-agent pair geometry remains clean.
-            if self.pgon_obs_slots > 0:
-                pgon_idxs = pgon_idxs_all[i]
-                pgon_pos = pg_diff_pos[i, pgon_idxs] / self.view_rad
-                pgon_vel = (state.pg_vel[pgon_idxs] - state.p_vel[i]) / self.pgon_max_speed
-                pgon_bat = (state.pg_batt[pgon_idxs] / self.pgon_init_batt) * 2 - 1
+            pgon_idxs = pgon_idxs_all[i]
+            pgon_pos = pg_diff_pos_pad[i, pgon_idxs] / self.view_rad
+            pgon_vel = (pg_vel_pad[pgon_idxs] - state.p_vel[i]) / self.pgon_max_speed
+            pgon_bat = (pg_batt_pad[pgon_idxs] / self.pgon_init_batt) * 2 - 1
 
-                pg_oor = pg_dists_k_all[i] == jnp.inf
-                pg_zero_2d = lambda a : jnp.where(pg_oor[:, None], 0.0, a)
-                pg_zero_1d = lambda a : jnp.where(pg_oor         , 0.0, a)
-                pgon_pos = pg_zero_2d(pgon_pos)
-                pgon_vel = pg_zero_2d(pgon_vel)
-                pgon_bat = pg_zero_1d(pgon_bat)
+            pg_oor = pg_dists_k_all[i] == jnp.inf
+            pg_zero_2d = lambda a : jnp.where(pg_oor[:, None], 0.0, a)
+            pg_zero_1d = lambda a : jnp.where(pg_oor         , 0.0, a)
+            pgon_pos = pg_zero_2d(pgon_pos)
+            pgon_vel = pg_zero_2d(pgon_vel)
+            pgon_bat = pg_zero_1d(pgon_bat)
 
-                pg_pos_norm = jnp.linalg.norm(pgon_pos, axis=-1)
-                pg_vel_norm = jnp.linalg.norm(pgon_vel, axis=-1)
-                pg_r_hat = pgon_pos / (pg_pos_norm[:, None] + self.eps)
-                pg_radial = jnp.sum(pg_r_hat * pgon_vel, axis=-1)
-                pg_u_perp = pgon_vel - pg_radial[:, None] * pg_r_hat
-                pg_tang = jnp.linalg.norm(pg_u_perp, axis=-1)
+            pg_pos_norm = jnp.linalg.norm(pgon_pos, axis=-1)
+            pg_vel_norm = jnp.linalg.norm(pgon_vel, axis=-1)
+            pg_r_hat = pgon_pos / (pg_pos_norm[:, None] + self.eps)
+            pg_radial = jnp.sum(pg_r_hat * pgon_vel, axis=-1)
+            pg_u_perp = pgon_vel - pg_radial[:, None] * pg_r_hat
+            pg_tang = jnp.linalg.norm(pg_u_perp, axis=-1)
 
-                pg_rng = (jnp.clip(pg_pos_norm / (sqrt3 + self.eps), 0.0, 1.0) * PRE(2.0) - PRE(1.0))
-                pg_spd = (jnp.clip(pg_vel_norm / (sqrt3 + self.eps), 0.0, 1.0) * PRE(2.0) - PRE(1.0))
-                pg_rdot = jnp.clip(pg_radial / (sqrt3 + self.eps), -1.0, 1.0)
-                pg_tan = (jnp.clip(pg_tang / (sqrt3 + self.eps), 0.0, 1.0) * PRE(2.0) - PRE(1.0))
+            pg_rng = (jnp.clip(pg_pos_norm / (sqrt3 + self.eps), 0.0, 1.0) * PRE(2.0) - PRE(1.0))
+            pg_spd = (jnp.clip(pg_vel_norm / (sqrt3 + self.eps), 0.0, 1.0) * PRE(2.0) - PRE(1.0))
+            pg_rdot = jnp.clip(pg_radial / (sqrt3 + self.eps), -1.0, 1.0)
+            pg_tan = (jnp.clip(pg_tang / (sqrt3 + self.eps), 0.0, 1.0) * PRE(2.0) - PRE(1.0))
 
-                pg_inv = jnp.stack([
-                    pg_zero_1d(pg_rng),
-                    pg_zero_1d(pg_spd),
-                    pg_zero_1d(pg_rdot),
-                    pg_zero_1d(pg_tan),
-                ], axis=-1)
+            pg_inv = jnp.stack([
+                pg_zero_1d(pg_rng),
+                pg_zero_1d(pg_spd),
+                pg_zero_1d(pg_rdot),
+                pg_zero_1d(pg_tan),
+            ], axis=-1)
 
-                pgon_ = jnp.concatenate([
-                    pgon_pos,
-                    pgon_vel,
-                    pgon_bat[:, None],
-                    pg_inv,
-                ], axis=-1).flatten()
-            else:
-                pgon_ = jnp.zeros((0,), dtype=PRE)
+            pgon_ = jnp.concatenate([
+                pgon_pos,
+                pgon_vel,
+                pgon_bat[:, None],
+                pg_inv,
+            ], axis=-1).flatten()
 
             # Flatten and scale aerials.
             # aeri_ = state.snapshots[i].flatten() * 2 - 1
