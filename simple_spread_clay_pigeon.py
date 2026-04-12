@@ -171,7 +171,7 @@ class SimpleSpreadMPE(MultiAgentEnv):
         self.fire_refr    = 5    # Fire refractory period
         self.obs_slots    = 5
         self.pgon_obs_slots = self.obs_slots
-        self.pgon_init_batt = 1.0
+        self.pgon_init_batt = 2.0
         self.pgon_accel     = self.accel * 0.75
         self.pgon_max_speed = self.max_speed * 0.9
         self.pgon_safe_alt  = self.body_rad * 2.0
@@ -254,7 +254,26 @@ class SimpleSpreadMPE(MultiAgentEnv):
             self.hmap = self.hmap * 0.0
     
     # HELPERS -------------------------------------------------------------- #
-    
+
+    def agent_pigeon_interactions(self, agnt_pos, agnt_done, pg_pos, pg_done):
+        """Visible, valid agent->pigeon relative geometry."""
+        diff_pos = pg_pos[None, :, :] - agnt_pos[:, None, :]
+        sqr_dist = jnp.sum(diff_pos ** 2, axis=-1)
+        keep = (sqr_dist < self.view_rad_sqr) & ((~agnt_done)[:, None] & (~pg_done)[None, :])
+        diff_pos = jnp.where(keep[..., None], diff_pos, 0.0)
+        sqr_dist = jnp.where(keep, sqr_dist, 0.0)
+        return diff_pos, sqr_dist
+
+    def pigeon_agent_collisions(self, agnt_pos, agnt_done, pg_pos, pg_done):
+        if self.num_pgon == 0:
+            return jnp.zeros((0,), dtype=jnp.int32)
+        diff_pos = pg_pos[None, :, :] - agnt_pos[:, None, :]
+        sqr_dist = jnp.sum(diff_pos ** 2, axis=-1)
+        coll = ((~agnt_done)[:, None] & (~pg_done)[None, :]
+                & (sqr_dist > 0.0)
+                & (sqr_dist < self.body_rad_sqr * 2))
+        return jnp.sum(coll, axis=0).astype(jnp.int32)
+
     # Compute agent interactions used in step_env, reset, obs, and rewards.
     # Returns relative positions, squared distances, and collisions, masked
     # to contain positive floats for valid and visible interactions only.
@@ -273,12 +292,12 @@ class SimpleSpreadMPE(MultiAgentEnv):
         sqr_dist = sqr_dist * valid_mask.astype(PRE)
 
         # Calculate relative positions and squared dists from agents to clay pigeons.
-        pg_diff_pos = state.pg_pos[None, :, :] - state.p_pos[:, None, :] # [N,P,dim_p]
-        pg_sqr_dist = jnp.sum(pg_diff_pos ** 2, axis=-1)
-        pg_visib_mask = (pg_sqr_dist < self.view_rad_sqr).astype(PRE)
-        pg_valid_mask = (~state.done)[:, None] & (~state.pg_done)[None, :]
-        pg_diff_pos = pg_diff_pos * (pg_visib_mask * pg_valid_mask.astype(PRE))[..., None]
-        pg_sqr_dist = pg_sqr_dist * pg_visib_mask * pg_valid_mask.astype(PRE)
+        pg_diff_pos, pg_sqr_dist = self.agent_pigeon_interactions(
+            state.p_pos,
+            state.done,
+            state.pg_pos,
+            state.pg_done,
+        )
 
         # Find agent-agent and agent-terrain collisions.
         agnt_colls   = jnp.sum((sqr_dist < self.body_rad_sqr * 2) 
@@ -287,12 +306,8 @@ class SimpleSpreadMPE(MultiAgentEnv):
         land_heights = sample_hmap(state.hmap, norm_pos[:, :-1])
         land_colls   = (norm_pos[:, -1] - land_heights) < self.nrm_body_rad
 
-        # Find clay-pigeon collisions with agents / terrain.
-        pg_agnt_colls   = jnp.sum((pg_sqr_dist < self.body_rad_sqr * 2)
-                                & (pg_sqr_dist > 0), axis=0) # int [P]
-        pg_norm_pos     = state.pg_pos / self.env_size
-        pg_land_heights = sample_hmap(state.hmap, pg_norm_pos[:, :-1])
-        pg_land_colls   = (pg_norm_pos[:, -1] - pg_land_heights) < self.nrm_body_rad
+        # Clay-pigeon terrain heights are used by the flee controller.
+        pg_land_heights = sample_hmap(state.hmap, state.pg_pos[:, :2] / self.env_size)
 
         # Create aerial 'snapshots' for agent observations.
         aerials   = self.observe_hmap(state)
@@ -306,9 +321,7 @@ class SimpleSpreadMPE(MultiAgentEnv):
             agnt_colls,
             land_heights,
             land_colls,
-            pg_agnt_colls,
             pg_land_heights,
-            pg_land_colls,
             aerials,
             snapshots,
         )
@@ -400,15 +413,27 @@ class SimpleSpreadMPE(MultiAgentEnv):
 
     # Hard-coded clay pigeons flee away from nearby agents while steering clear
     # of terrain and environment boundaries.
-    def step_pigeons(self, state: State, pg_diff_pos, pg_land_heights, pg_land_colls):
+    def step_pigeons(self, state: State, pg_diff_pos, pg_sqr_dist, pg_land_heights):
         if self.num_pgon == 0:
-            return state.pg_pos, state.pg_vel, state.pg_batt, state.pg_done
+            return state.pg_pos, state.pg_vel
 
-        # Flee away from visible agents.
-        d = jnp.linalg.norm(pg_diff_pos, axis=-1) + self.eps
-        away = pg_diff_pos / d[..., None]
+        # Flee away from up to the 3 nearest visible agents for each pigeon.
+        # pg_diff_pos is [A, P, 3], with invisible / invalid interactions zero-masked.
+        max_threats = 3
+        pg_diff = jnp.swapaxes(pg_diff_pos, 0, 1)      # [P, A, 3]
+        pg_sqr = jnp.swapaxes(pg_sqr_dist, 0, 1)       # [P, A]
+        pad_agents = max(0, max_threats - self.num_agnt)
+        pg_sqr_pad = jnp.pad(pg_sqr, ((0, 0), (0, pad_agents)), constant_values=jnp.inf)
+        pg_diff_pad = jnp.pad(pg_diff, ((0, 0), (0, pad_agents), (0, 0)))
+        _, near_idxs = jax.lax.top_k(-pg_sqr_pad, max_threats)
+        near_sqr = jnp.take_along_axis(pg_sqr_pad, near_idxs, axis=-1)
+        near_diff = jnp.take_along_axis(pg_diff_pad, near_idxs[..., None], axis=1)
+        near_valid = jnp.isfinite(near_sqr) & (near_sqr > 0.0)
+
+        d = jnp.sqrt(jnp.maximum(near_sqr, 0.0)) + self.eps
+        away = near_diff / d[..., None]
         away_w = 1.0 / d[..., None]
-        flee = jnp.sum(away * away_w, axis=0)
+        flee = jnp.sum(jnp.where(near_valid[..., None], away * away_w, 0.0), axis=1)
 
         # Push up when too close to terrain. Keep a little lift to counter gravity.
         alt = state.pg_pos[:, -1] / self.env_size - pg_land_heights
@@ -434,22 +459,18 @@ class SimpleSpreadMPE(MultiAgentEnv):
         p_force = p_force.at[:, 2].add(self.gravity + terr_push * self.pgon_terr_gain)
         p_force = jnp.where(state.pg_done[:, None], 0.0, p_force)
 
-        # Integrate pigeons normally, then project any terrain penetration back
-        # to the terrain surface. This prevents birds from rendering underground
-        # if they descend too quickly for the soft avoidance force to catch them.
-        pg_frozen = state.pg_done
-        pg_pos, pg_vel = self._integrate_state(p_force, state.pg_pos, state.pg_vel, pg_frozen)
+        pg_pos, pg_vel = self._integrate_state(p_force, state.pg_pos, state.pg_vel, state.pg_done)
         pg_vel, _ = self.limit_speed(pg_vel, self.pgon_max_speed)
 
-        pg_xy = jnp.clip(pg_pos[:, :2] / self.env_size, 0.0, 1.0)
-        pg_land_heights_new = sample_hmap(state.hmap, pg_xy)
-        min_pg_z = (pg_land_heights_new + self.nrm_body_rad) * self.env_size
-        penetrated = pg_pos[:, 2] < min_pg_z
-        pg_pos = pg_pos.at[:, 2].set(jnp.maximum(pg_pos[:, 2], min_pg_z))
+        # Project any terrain penetration back up to the local surface.
+        pg_norm_xy = pg_pos[:, :2] / self.env_size
+        pg_land_new = sample_hmap(state.hmap, pg_norm_xy)
+        pg_min_z = (pg_land_new + self.nrm_body_rad) * self.env_size
+        penetrated = pg_pos[:, 2] < pg_min_z
+        pg_pos = pg_pos.at[:, 2].set(jnp.maximum(pg_pos[:, 2], pg_min_z))
         pg_vel = pg_vel.at[:, 2].set(jnp.where(penetrated, jnp.maximum(pg_vel[:, 2], 0.0), pg_vel[:, 2]))
 
-        # Update battery / done. Clay pigeons are one-hit kills by default.
-        return pg_pos.astype(PRE), pg_vel.astype(PRE), state.pg_batt, state.pg_done
+        return pg_pos.astype(PRE), pg_vel.astype(PRE)
 
     # Update agent attitudes given attitude update actions.
     def update_att(self, op_att, old_att, att_action):
@@ -485,9 +506,7 @@ class SimpleSpreadMPE(MultiAgentEnv):
             agnt_colls,
             land_heights,
             land_colls,
-            pg_agnt_colls,
             pg_land_heights,
-            pg_land_colls,
             aerials,
             snapshots,
         ) = self.interactions(state)
@@ -502,7 +521,7 @@ class SimpleSpreadMPE(MultiAgentEnv):
         p_pos, p_vel = self._world_step(key_w, state, xyz)
 
         # Move clay pigeons according to their hard-coded flee policy.
-        pg_pos, pg_vel, _, _ = self.step_pigeons(state, pg_diff_pos, pg_land_heights, pg_land_colls)
+        pg_pos, pg_vel = self.step_pigeons(state, pg_diff_pos, pg_sqr_dist, pg_land_heights)
         
         # Stepwise update attitudes, not including the team leader/s,
         # which should always represent their pre-selected intent/s.
@@ -574,9 +593,17 @@ class SimpleSpreadMPE(MultiAgentEnv):
         batt_cost     = hit_cost #throttle_cost + fire_cost + hit_cost
         batt          = jnp.clip(state.batt - batt_cost, min=0.0)
 
-        # Clay pigeons are one-hit kills by default.
+        # Clay pigeons are two-hit kills by default.
         pg_batt = jnp.clip(state.pg_batt - total_pg_hits_by_pgon, min=0.0)
         pg_done_prev = state.pg_done
+
+        # Post-move pigeon death bookkeeping only needs agent collisions and
+        # boundary checks. Terrain penetration has already been projected away.
+        pg_agnt_colls = self.pigeon_agent_collisions(p_pos, state.done, pg_pos, state.pg_done)
+        pg_bound_colls = (jnp.any(pg_pos < 0.0, axis=-1) |
+                          jnp.any(pg_pos[:, :-1] > self.env_size, axis=-1) |
+                          (pg_pos[:, -1] > self.env_size * self.height_lim))
+        pg_done = (pg_agnt_colls > 0) | pg_bound_colls | (pg_batt == 0.0) | state.pg_done
 
         # Update state. Only non-grounded agents move.
         state = state.replace(
@@ -586,6 +613,7 @@ class SimpleSpreadMPE(MultiAgentEnv):
             pg_pos=pg_pos.astype(PRE),
             pg_vel=pg_vel.astype(PRE),
             pg_batt=pg_batt.astype(PRE),
+            pg_done=pg_done.astype(bool),
             pos_hist=pos_hist.astype(PRE),
             vel_hist=vel_hist.astype(PRE),
             attitudes=attitudes.astype(PRE),
@@ -608,15 +636,6 @@ class SimpleSpreadMPE(MultiAgentEnv):
         bound_colls = (jnp.any(p < 0.0, axis=-1) |                   # xyz under zero
                        jnp.any(p[:, :-1] > self.env_size, axis=-1) | # xy over env_size
                        (p[:, -1] > self.env_size * self.height_lim)) # z over height
-
-        # Find clay pigeon collisions against terrain / boundaries.
-        pg = state.pg_pos
-        pg_norm_pos = pg / self.env_size
-        pg_land_heights_new = sample_hmap(state.hmap, pg_norm_pos[:, :-1])
-        pg_land_colls_new = (pg_norm_pos[:, -1] - pg_land_heights_new) < self.nrm_body_rad
-        pg_bound_colls = (jnp.any(pg < 0.0, axis=-1) |
-                          jnp.any(pg[:, :-1] > self.env_size, axis=-1) |
-                          (pg[:, -1] > self.env_size * self.height_lim))
         
         # Set dones according to collisions, battery levels, and timesteps.
         # Increment done_ago (counts the steps since an agent deactivated).
@@ -630,9 +649,6 @@ class SimpleSpreadMPE(MultiAgentEnv):
         done_ago = jnp.where(done & (done_ago == -1), 0, done_ago)
         state = state.replace(done=done)
         state = state.replace(done_ago=done_ago)
-
-        pg_done = (pg_agnt_colls > 0) | pg_land_colls_new | pg_bound_colls | (pg_batt == 0.0) | state.pg_done
-        state = state.replace(pg_done=pg_done)
 
         # Tally kills per agent, including clay pigeons.
         g_kills = jnp.sum(g_hits * (done_ago == 0)[None, :].astype(int), axis=-1)
@@ -726,7 +742,7 @@ class SimpleSpreadMPE(MultiAgentEnv):
             g_kills=jnp.zeros((self.num_agnt)).astype(int),
         )
 
-        (diff_pos, sqr_dist, pg_diff_pos, pg_sqr_dist, _, _, _, _, _, _, aerials, snapshots) = self.interactions(state)
+        (diff_pos, sqr_dist, pg_diff_pos, pg_sqr_dist, _, _, _, _, aerials, snapshots) = self.interactions(state)
         state = state.replace(snapshots=snapshots)
         obs = self.get_obs(diff_pos, sqr_dist, pg_diff_pos, pg_sqr_dist, aerials, state)
         return obs, state
