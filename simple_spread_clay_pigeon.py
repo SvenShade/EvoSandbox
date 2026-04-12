@@ -421,7 +421,11 @@ class SimpleSpreadMPE(MultiAgentEnv):
         # pg_diff_pos is [A, P, 3], with invisible / invalid interactions zero-masked.
         max_threats = 3
         pg_diff = jnp.swapaxes(pg_diff_pos, 0, 1)      # [P, A, 3]
-        pg_sqr = jnp.swapaxes(pg_sqr_dist, 0, 1)       # [P, A]
+        pg_sqr = jnp.swapaxes(
+            jnp.where(pg_sqr_dist > 0.0, pg_sqr_dist, jnp.inf),
+            0,
+            1,
+        ) # [P, A]
         pad_agents = max(0, max_threats - self.num_agnt)
         pg_sqr_pad = jnp.pad(pg_sqr, ((0, 0), (0, pad_agents)), constant_values=jnp.inf)
         pg_diff_pad = jnp.pad(pg_diff, ((0, 0), (0, pad_agents), (0, 0)))
