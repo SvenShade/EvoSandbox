@@ -29,7 +29,8 @@ import imageio
 import numpy as np
 import chex
 import flax
-from flax import struct
+from flax import struct, linen as nn
+from flax.linen.initializers import orthogonal
 import hydra
 import jax
 import jax.numpy as jnp
@@ -46,7 +47,6 @@ from tqdm import tqdm
 
 from mava.evaluator import get_eval_fn, make_ff_eval_act_fn
 from mava.networks import FeedForwardActor as Actor
-from mava.networks import FeedForwardValueNet as Critic
 from mava.systems.ppo.types import LearnerState, OptStates, Params, PPOTransition
 from mava.types import ActorApply, CriticApply, ExperimentOutput, LearnerFn, MarlEnv, Metrics
 from mava.utils import make_env as environments
@@ -70,13 +70,15 @@ class PPOTransitionCriticObs:
     critic_obs: chex.Array
 
 
-@struct.dataclass
-class CriticInput:
-    agents_view: chex.Array
+class ArrayCritic(nn.Module):
+    """Minimal array-native critic for custom critic_obs tensors."""
+    torso: nn.Module
 
-
-def as_critic_input(x: chex.Array) -> CriticInput:
-    return CriticInput(agents_view=x)
+    @nn.compact
+    def __call__(self, observation: chex.Array) -> chex.Array:
+        x = self.torso(observation)
+        x = nn.Dense(1, kernel_init=orthogonal(1.0))(x)
+        return jnp.squeeze(x, axis=-1)
 
 
 def unwrap_env_state(state: Any) -> Any:
@@ -266,7 +268,7 @@ def get_learner_fn(
             key, policy_key = jax.random.split(key)
             critic_obs = get_critic_obs(env_state)
             actor_policy = actor_apply_fn(params.actor_params, last_timestep.observation)
-            value = critic_apply_fn(params.critic_params, as_critic_input(critic_obs))
+            value = critic_apply_fn(params.critic_params, critic_obs)
             action = actor_policy.sample(seed=policy_key)
             log_prob = actor_policy.log_prob(action)
 
@@ -289,7 +291,7 @@ def get_learner_fn(
 
         # Calculate advantage
         params, opt_states, key, env_state, last_timestep, last_done = learner_state
-        last_val = critic_apply_fn(params.critic_params, as_critic_input(get_critic_obs(env_state)))
+        last_val = critic_apply_fn(params.critic_params, get_critic_obs(env_state))
 
         advantages, targets = calculate_gae(
             traj_batch, last_val, last_done, config.system.gamma, config.system.gae_lambda
@@ -344,7 +346,7 @@ def get_learner_fn(
                 ) -> Tuple:
                     """Calculate the critic loss."""
                     # Rerun network
-                    value = critic_apply_fn(critic_params, as_critic_input(traj_batch.critic_obs))
+                    value = critic_apply_fn(critic_params, traj_batch.critic_obs)
 
                     # MSE loss
                     if config.system.use_ppo_clipping:
@@ -506,7 +508,7 @@ def learner_setup(
     critic_torso = hydra.utils.instantiate(config.network.critic_network.pre_torso)
 
     actor_network = Actor(torso=actor_torso, action_head=actor_action_head)
-    critic_network = Critic(torso=critic_torso, centralised_critic=False)
+    critic_network = ArrayCritic(torso=critic_torso)
 
     actor_lr = make_learning_rate(config.system.actor_lr, config)
     critic_lr = make_learning_rate(config.system.critic_lr, config)
@@ -529,7 +531,7 @@ def learner_setup(
     actor_opt_state = actor_optim.init(actor_params)
 
     # Initialise critic params and optimiser state.
-    critic_params = critic_network.init(critic_net_key, as_critic_input(init_x))
+    critic_params = critic_network.init(critic_net_key, init_x)
     critic_opt_state = critic_optim.init(critic_params)
 
     # Pack params.
