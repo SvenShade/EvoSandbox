@@ -70,25 +70,31 @@ class PPOTransitionCriticObs:
     critic_obs: chex.Array
 
 
+@struct.dataclass
+class CriticInput:
+    agents_view: chex.Array
+
+
+def as_critic_input(x: chex.Array) -> CriticInput:
+    return CriticInput(agents_view=x)
+
+
 def unwrap_env_state(state: Any) -> Any:
     seen = set()
     while True:
         if hasattr(state, "critic_obs"):
             return state
-
         state_id = id(state)
         if state_id in seen:
             raise RuntimeError("Cycle detected while unwrapping env state.")
         seen.add(state_id)
-
         if hasattr(state, "env_state"):
             state = state.env_state
         elif hasattr(state, "state"):
             state = state.state
         else:
             raise AttributeError(
-                f"Could not find `critic_obs` while unwrapping. "
-                f"Stopped at type {type(state).__name__}."
+                f"Could not find base env state with `critic_obs`. Stopped at type {type(state).__name__}."
             )
 
 
@@ -260,7 +266,7 @@ def get_learner_fn(
             key, policy_key = jax.random.split(key)
             critic_obs = get_critic_obs(env_state)
             actor_policy = actor_apply_fn(params.actor_params, last_timestep.observation)
-            value = critic_apply_fn(params.critic_params, critic_obs)
+            value = critic_apply_fn(params.critic_params, as_critic_input(critic_obs))
             action = actor_policy.sample(seed=policy_key)
             log_prob = actor_policy.log_prob(action)
 
@@ -283,7 +289,7 @@ def get_learner_fn(
 
         # Calculate advantage
         params, opt_states, key, env_state, last_timestep, last_done = learner_state
-        last_val = critic_apply_fn(params.critic_params, get_critic_obs(env_state))
+        last_val = critic_apply_fn(params.critic_params, as_critic_input(get_critic_obs(env_state)))
 
         advantages, targets = calculate_gae(
             traj_batch, last_val, last_done, config.system.gamma, config.system.gae_lambda
@@ -338,7 +344,7 @@ def get_learner_fn(
                 ) -> Tuple:
                     """Calculate the critic loss."""
                     # Rerun network
-                    value = critic_apply_fn(critic_params, traj_batch.critic_obs)
+                    value = critic_apply_fn(critic_params, as_critic_input(traj_batch.critic_obs))
 
                     # MSE loss
                     if config.system.use_ppo_clipping:
@@ -523,7 +529,7 @@ def learner_setup(
     actor_opt_state = actor_optim.init(actor_params)
 
     # Initialise critic params and optimiser state.
-    critic_params = critic_network.init(critic_net_key, init_x)
+    critic_params = critic_network.init(critic_net_key, as_critic_input(init_x))
     critic_opt_state = critic_optim.init(critic_params)
 
     # Pack params.
