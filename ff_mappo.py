@@ -522,16 +522,22 @@ def learner_setup(
         optax.adam(critic_lr, eps=1e-5),
     )
 
-    # Initialise observation with obs of all agents.
+    # Initialise actor params from the actor observation spec.
     obs = env.observation_spec.generate_value()
     init_x = tree.map(lambda x: x[jnp.newaxis, ...], obs)
+
+    # Initialise critic params from a real critic observation tensor, since the
+    # critic no longer consumes Mava's observation object.
+    key, init_env_key = jax.random.split(key)
+    init_env_state, _ = env.reset(init_env_key, 0)
+    init_critic_x = get_critic_obs(init_env_state)[jnp.newaxis, ...]
 
     # Initialise actor params and optimiser state.
     actor_params = actor_network.init(actor_net_key, init_x)
     actor_opt_state = actor_optim.init(actor_params)
 
     # Initialise critic params and optimiser state.
-    critic_params = critic_network.init(critic_net_key, init_x)
+    critic_params = critic_network.init(critic_net_key, init_critic_x)
     critic_opt_state = critic_optim.init(critic_params)
 
     # Pack params.
