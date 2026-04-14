@@ -71,9 +71,25 @@ class PPOTransitionCriticObs:
 
 
 def unwrap_env_state(state: Any) -> Any:
-    while hasattr(state, "env_state"):
-        state = state.env_state
-    return state
+    seen = set()
+    while True:
+        if hasattr(state, "critic_obs"):
+            return state
+
+        state_id = id(state)
+        if state_id in seen:
+            raise RuntimeError("Cycle detected while unwrapping env state.")
+        seen.add(state_id)
+
+        if hasattr(state, "env_state"):
+            state = state.env_state
+        elif hasattr(state, "state"):
+            state = state.state
+        else:
+            raise AttributeError(
+                f"Could not find `critic_obs` while unwrapping. "
+                f"Stopped at type {type(state).__name__}."
+            )
 
 
 def get_critic_obs(state: Any) -> chex.Array:
@@ -171,7 +187,7 @@ def final_episodes(config: DictConfig,
             # Remove the batch dimension from the action before passing it to the environment.
             action = action.squeeze(0)
             state, timestep = step_fn(state, action)
-            states.append(state.env_state.state)
+            states.append(unwrap_env_state(state))
             info = f'EPISODE {ep + 1}/{num_episodes}, TIMESTEP {step}.'
             steps.append((info, False))
             pbar.update()
