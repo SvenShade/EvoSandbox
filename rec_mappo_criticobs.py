@@ -221,21 +221,23 @@ def final_episodes(config: DictConfig, params: FrozenDict, actor_network: Actor)
     (key, *reset_keys) = jax.random.split(key, num_episodes + 1)
     for ep in range(num_episodes):
         state, timestep = reset_fn(reset_keys[ep], tot_steps=0)
-        hidden_state = ScannedRNN.initialize_carry((1, env.num_agents), render_config.network.hidden_state_dim)
-        done = jnp.zeros((1, env.num_agents), dtype=bool)
+        hidden_state = ScannedRNN.initialize_carry(
+            (1, env.num_agents), render_config.network.hidden_state_dim
+        )
+        done = jnp.zeros((1, 1, env.num_agents), dtype=bool)
         step = 0
         while not timestep.last():
             step += 1
             key, action_key = jax.random.split(key)
-            batched_obs = tree.map(lambda x: x[jnp.newaxis, ...], timestep.observation)
+            batched_obs = tree.map(lambda x: x[jnp.newaxis, jnp.newaxis, ...], timestep.observation)
             hidden_state, pi = apply_fn(params, hidden_state, (batched_obs, done))
             if render_config.arch.evaluation_greedy:
                 action = pi.mode()
             else:
                 action = pi.sample(seed=action_key)
-            action = action.squeeze(0)
+            action = jnp.squeeze(action, axis=(0, 1))
             state, timestep = step_fn(state, action)
-            done = timestep.last().repeat(env.num_agents).reshape(1, -1)
+            done = jnp.full((1, 1, env.num_agents), timestep.last(), dtype=bool)
             states.append(unwrap_env_state(state))
             info = f"EPISODE {ep + 1}/{num_episodes}, TIMESTEP {step}."
             steps.append((info, False))
