@@ -716,8 +716,9 @@ def run_experiment(_config: DictConfig) -> float:
             )
 
         eval_batch_size = get_num_eval_envs(config, absolute_metric=False)
+        eval_num_agents = eval_env.num_agents
         eval_hs = ScannedRNN.initialize_carry(
-            (n_devices, eval_batch_size, config.system.num_agents),
+            (n_devices, eval_batch_size, eval_num_agents),
             config.network.hidden_state_dim,
         )
 
@@ -762,8 +763,9 @@ def run_experiment(_config: DictConfig) -> float:
 
         if config.arch.absolute_metric:
             eval_batch_size = get_num_eval_envs(config, absolute_metric=True)
+            eval_num_agents = eval_env.num_agents
             eval_hs = ScannedRNN.initialize_carry(
-                (n_devices, eval_batch_size, config.system.num_agents),
+                (n_devices, eval_batch_size, eval_num_agents),
                 config.network.hidden_state_dim,
             )
             abs_metric_evaluator = get_eval_fn(eval_env, eval_act_fn, config, absolute_metric=True)
