@@ -359,7 +359,10 @@ class MLPTorso(nn.Module):
     @nn.compact
     def __call__(self, x: chex.Array) -> chex.Array:
         x = x.astype(jnp.float32)
-        B, N, D = x.shape
+
+        lead = x.shape[:-2]
+        N, D = x.shape[-2:]
+        x = x.reshape((-1, N, D))
 
         pair_d = self.k * (self.k - 1) // 2
         ter_d = self.view * self.view
@@ -436,6 +439,7 @@ class MLPTorso(nn.Module):
         # Concatenate and pass through output layer.
         x = jnp.concatenate([ego_e, pair_e, nbr_e, pgon_e, ter_e], axis=-1)
         x = DenseSeq(self.out_dim)(x)
+        x = x.reshape((*lead, N, x.shape[-1]))
         return x
 
 
