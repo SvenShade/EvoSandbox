@@ -576,16 +576,19 @@ def learner_setup(
 
     key, init_env_key = jax.random.split(key)
     init_env_state, _ = env.reset(init_env_key, 0)
-    init_critic_obs = get_critic_obs(init_env_state)[jnp.newaxis, ...]
-    init_critic_done = jnp.zeros((1, num_agents), dtype=bool)
+    init_critic_obs = get_critic_obs(init_env_state)[jnp.newaxis, jnp.newaxis, ...]
+    init_critic_done = jnp.zeros((1, 1, num_agents), dtype=bool)
     init_critic_obs_done = (init_critic_obs, init_critic_done)
-    init_critic_hstate = ScannedRNN.initialize_carry(
+    init_critic_hstate_params = ScannedRNN.initialize_carry(
         (1, num_agents), config.network.hidden_state_dim
+    )
+    init_critic_hstate = ScannedRNN.initialize_carry(
+        (config.arch.num_envs, num_agents), config.network.hidden_state_dim
     )
 
     actor_params = actor_network.init(actor_net_key, init_policy_hstate, init_obs_done)
     actor_opt_state = actor_optim.init(actor_params)
-    critic_params = critic_network.init(critic_net_key, init_critic_hstate, init_critic_obs_done)
+    critic_params = critic_network.init(critic_net_key, init_critic_hstate_params, init_critic_obs_done)
     critic_opt_state = critic_optim.init(critic_params)
 
     apply_fns = (actor_network.apply, critic_network.apply)
