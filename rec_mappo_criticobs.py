@@ -39,16 +39,18 @@ import cv2
 import subprocess
 from typing import Any, Tuple
 from colorama import Fore, Style
-from flax import linen as nn, struct
+from flax import struct
 from flax.core.frozen_dict import FrozenDict
-from flax.linen.initializers import orthogonal
 from jax import tree
 from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 
 from mava.evaluator import get_eval_fn, get_num_eval_envs, make_rec_eval_act_fn
-from mava.networks import RecurrentActor as Actor
-from mava.networks import ScannedRNN
+from mava.networks.base import (
+    ArrayRecurrentValueNet as Critic,
+    RecurrentActor as Actor,
+    ScannedRNN,
+)
 from mava.systems.ppo.types import (
     HiddenStates,
     OptStates,
@@ -85,23 +87,6 @@ class RNNPPOTransitionCriticObs:
     obs: chex.Array
     critic_obs: chex.Array
     hstates: HiddenStates
-
-
-class ArrayRecurrentCritic(nn.Module):
-    """Array-native recurrent critic for custom critic_obs tensors."""
-
-    pre_torso: nn.Module
-    post_torso: nn.Module
-    hidden_state_dim: int
-
-    @nn.compact
-    def __call__(self, hidden_state: chex.Array, obs_done: Tuple[chex.Array, chex.Array]):
-        obs, done = obs_done
-        x = self.pre_torso(obs)
-        hidden_state, x = ScannedRNN()(hidden_state, (x, done))
-        x = self.post_torso(x)
-        x = nn.Dense(1, kernel_init=orthogonal(1.0))(x)
-        return hidden_state, jnp.squeeze(x, axis=-1)
 
 
 def unwrap_env_state(state: Any) -> Any:
@@ -545,7 +530,7 @@ def learner_setup(
         action_head=actor_action_head,
         hidden_state_dim=config.network.hidden_state_dim,
     )
-    critic_network = ArrayRecurrentCritic(
+    critic_network = Critic(
         pre_torso=critic_pre_torso,
         post_torso=critic_post_torso,
         hidden_state_dim=config.network.hidden_state_dim,
