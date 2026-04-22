@@ -1,3 +1,17 @@
+sudo mkdir -p /etc/systemd/system/docker.service.d
+
+sudo tee /etc/systemd/system/docker.service.d/http-proxy.conf >/dev/null <<'EOF'
+[Service]
+Environment="HTTP_PROXY=http://YOUR_PROXY_HOST:PORT"
+Environment="HTTPS_PROXY=http://YOUR_PROXY_HOST:PORT"
+Environment="NO_PROXY=localhost,127.0.0.1,docker.io,registry-1.docker.io"
+EOF
+
+echo "$HTTP_PROXY"
+echo "$HTTPS_PROXY"
+echo "$NO_PROXY"
+
+
 SwarmVSwarmMPE – quick brief
 
   Agents/Teams: Homogeneous agents split into two swarms (A/B). Single shared policy; team encoded in obs.
