@@ -185,6 +185,13 @@ class SimpleSpreadMPE(MultiAgentEnv):
         self.pgon_safe_alt  = self.body_rad * 2.0
         self.pgon_terr_gain = self.pgon_accel * 1.25
         self.pgon_edge_gain = self.pgon_accel * 0.5
+        self.pgon_flee_rad  = float(kwargs.get("pigeon_flee_rad", self.view_rad * 3.0))
+        self.pgon_flee_alpha = float(kwargs.get("pigeon_flee_alpha", 1.5))
+        self.pgon_flee_gain = float(kwargs.get("pigeon_flee_gain", self.pgon_accel))
+        self.pgon_flee_cruise_spd = float(kwargs.get(
+            "pigeon_flee_cruise_speed", self.pgon_max_speed * 0.65))
+        self.pgon_flee_speed_gain = float(kwargs.get("pigeon_flee_speed_gain", 0.65))
+        self.pgon_safety_blend = float(kwargs.get("pigeon_safety_blend", 0.25))
 
         # Energy-inspired local swarming controller. The defaults are scaled
         # from environment dimensions so the same controller can drive agents
@@ -638,25 +645,46 @@ class SimpleSpreadMPE(MultiAgentEnv):
         att = jnp.clip((target_att - state.attitudes) / (self.att_update + self.eps), -1.0, 1.0)
         return jnp.concatenate([xyz, att], axis=-1).astype(PRE)
 
-    # Energy-based clay-pigeon swarming controller. This replaces the previous
-    # prey-only flee controller while keeping the step_pigeons call site stable.
+    def _pigeon_flee_force(self, state: State, pg_land_heights):
+        # Energy-gradient style flee term:
+        #   E(d) = J / alpha * (1 - d / D)^alpha, for d < D.
+        # Its negative gradient pushes each pigeon away from nearby agents with
+        # compact support. The radius is intentionally larger than the agent
+        # observation radius so pigeons begin fleeing before the swarm arrives.
+        diff = state.pg_pos[:, None, :] - state.p_pos[None, :, :]  # agent -> pigeon
+        sqr_dist = jnp.sum(diff ** 2, axis=-1)
+        dist = jnp.sqrt(jnp.maximum(sqr_dist, 0.0)) + self.eps
+        valid = ((~state.pg_done)[:, None]
+                 & (~state.done)[None, :]
+                 & (sqr_dist > 0.0)
+                 & (sqr_dist < self.pgon_flee_rad ** 2))
+
+        away = diff / dist[..., None]
+        falloff = jnp.clip(1.0 - dist / self.pgon_flee_rad, 0.0, 1.0)
+        weights = jnp.where(valid, falloff ** (self.pgon_flee_alpha - 1.0), 0.0)
+        threat_mass = jnp.sum(weights, axis=1, keepdims=True)
+        flee_dir = self._unit(jnp.sum(away * weights[..., None], axis=1))
+        flee_strength = jnp.clip(threat_mass, 0.0, 1.0)
+        flee = flee_dir * self.pgon_flee_gain * flee_strength
+
+        safety = self._terrain_edge_force(
+            state.pg_pos, pg_land_heights, state.pg_done, self.pgon_accel)
+        has_threat = threat_mass > 0.0
+        blended_safety = jnp.where(has_threat, safety * self.pgon_safety_blend, safety)
+
+        heading = self._motion_heading(state.pg_vel, state.pg_vel)
+        desired_heading = jnp.where(has_threat, flee_dir, self._unit(blended_safety + heading))
+        cruise = desired_heading * self.pgon_flee_cruise_spd - state.pg_vel
+        cruise = jnp.where(has_threat, cruise, 0.0)
+
+        force = flee + blended_safety + cruise * self.pgon_flee_speed_gain
+        force = jnp.where(state.pg_done[:, None], 0.0, force)
+        return self._clip_norm(force, self.pgon_accel).astype(PRE)
+
+    # Energy-based clay-pigeon flee controller.
     def step_pigeons(self, state: State, pg_diff_pos, pg_sqr_dist, pg_land_heights):
         del pg_diff_pos, pg_sqr_dist
-        p_force = self._swarming_energy_force(
-            state.pg_pos,
-            state.pg_vel,
-            state.pg_vel,
-            state.pg_done,
-            pg_land_heights,
-            self.pgon_max_speed,
-            self.pgon_accel,
-            jnp.zeros((0, self.dim_p), dtype=PRE),
-            jnp.zeros((0,), dtype=jnp.bool_),
-            0.0,
-            state.p_pos,
-            state.done,
-            self.ctrl_threat_gain,
-        )
+        p_force = self._pigeon_flee_force(state, pg_land_heights)
 
         pg_pos, pg_vel = self._integrate_state(p_force, state.pg_pos, state.pg_vel, state.pg_done)
         pg_vel, _ = self.limit_speed(pg_vel, self.pgon_max_speed)
